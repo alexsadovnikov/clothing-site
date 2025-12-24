@@ -30,8 +30,8 @@ services:
     volumes:
       - minio_data:/data
     ports:
-      - "127.0.0.1:9100:9000"
-      - "127.0.0.1:9101:9101"
+      - "127.0.0.1:9100:9000"   # S3 API наружу (nginx /media -> сюда)
+      - "127.0.0.1:9101:9101"   # Console
     restart: unless-stopped
 
   meilisearch:
@@ -48,6 +48,7 @@ services:
   web:
     build: ./apps/web
     container_name: clothing-web
+    env_file: .env
     ports:
       - "127.0.0.1:3000:3000"
     restart: unless-stopped
@@ -55,15 +56,58 @@ services:
   api:
     build: ./apps/api
     container_name: clothing-api
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      MINIO_ENDPOINT: minio:9000
+      MINIO_BUCKET: products
+      MEILI_HOST: http://meilisearch:7700
+      MEILI_MASTER_KEY: ${MEILI_MASTER_KEY}
+      MEILI_INDEX: products
+      AI_INTERNAL_URL: http://ai:8002
+      RQ_QUEUE: clothing
     ports:
       - "127.0.0.1:8001:8001"
+    depends_on:
+      - db
+      - redis
+      - minio
+      - meilisearch
+      - ai
     restart: unless-stopped
 
   ai:
     build: ./apps/ai
     container_name: clothing-ai
+    env_file: .env
     ports:
       - "127.0.0.1:8002:8002"
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+  worker:
+    build: ./apps/api
+    container_name: clothing-worker
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      MINIO_ENDPOINT: minio:9000
+      MINIO_BUCKET: products
+      MEILI_HOST: http://meilisearch:7700
+      MEILI_MASTER_KEY: ${MEILI_MASTER_KEY}
+      MEILI_INDEX: products
+      AI_INTERNAL_URL: http://ai:8002
+      RQ_QUEUE: clothing
+    depends_on:
+      - db
+      - redis
+      - minio
+      - meilisearch
+      - ai
+    command: ["python", "worker.py"]
     restart: unless-stopped
 
 volumes:

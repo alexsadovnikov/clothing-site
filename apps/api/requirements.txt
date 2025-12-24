@@ -1,2 +1,17 @@
 fastapi==0.115.6
 uvicorn[standard]==0.32.1
+
+SQLAlchemy==2.0.36
+alembic==1.13.3
+psycopg2-binary==2.9.9
+
+redis==5.2.0
+rq==1.16.2
+
+minio==7.2.15
+
+meilisearch==0.31.5
+
+pydantic-settings==2.6.1
+python-multipart==0.0.12
+requests==2.32.3
