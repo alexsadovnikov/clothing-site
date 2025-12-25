@@ -3,27 +3,44 @@ import uuid
 from datetime import datetime
 from typing import Any, Optional
 
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, UploadFile, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from sqlalchemy.orm import Session
 
 from storage import ensure_bucket, put_object
-from db import init_db, SessionLocal
-from models import Category, Media, AIJob, Product, ProductMedia
+from db import init_db, get_db, SessionLocal
+from models import Category, Media, AIJob, Product, ProductMedia, User
 from queueing import enqueue_process_job, enqueue_index_product
 from search_routes import router as catalog_router
 
+# ✅ Роуты авторизации должны быть в apps/api/auth.py (никакого auth_routes.py)
+from auth import router as auth_router, get_current_user  # type: ignore
+
+
+def _parse_cors_origins() -> list[str]:
+    raw = (os.getenv("CORS_ORIGINS") or "").strip()
+    if not raw:
+        return ["*"]
+    origins = [x.strip() for x in raw.split(",") if x.strip()]
+    return origins or ["*"]
+
+
 app = FastAPI(title="Clothing API", version="0.1")
+
+# сначала auth, потом остальное
+app.include_router(auth_router)
 app.include_router(catalog_router)
 
-# CORS — пока максимально открыто (позже можно ужесточить под домен)
+cors_origins = _parse_cors_origins()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=cors_origins,
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 # ----------------------------
 # Startup
@@ -34,13 +51,13 @@ def _startup():
     init_db()
     ensure_bucket()
 
-    # Seed категорий: запускаем только если таблица пустая
+    # Seed категорий: только если пусто (категории глобальные, общие для всех)
     with SessionLocal() as db:
         if db.query(Category).count() == 0:
             seed_categories(db)
 
 
-def seed_categories(db):
+def seed_categories(db: Session) -> None:
     """
     Минимальное дерево:
       - Одежда (odezhda) -> women/men
@@ -48,14 +65,14 @@ def seed_categories(db):
       - Аксессуары (aksessuary)
     """
     root_defs = [
-        ("odezhda", "Одежда", None),
-        ("obuv", "Обувь", None),
-        ("aksessuary", "Аксессуары", None),
+        ("odezhda", "Одежда"),
+        ("obuv", "Обувь"),
+        ("aksessuary", "Аксессуары"),
     ]
 
     roots: dict[str, Category] = {}
 
-    for slug, name, _ in root_defs:
+    for slug, name in root_defs:
         c = Category(
             id=str(uuid.uuid4()),
             parent_id=None,
@@ -69,7 +86,6 @@ def seed_categories(db):
         db.add(c)
         roots[slug] = c
 
-    # Подразделы women/men для одежды и обуви
     for parent_slug in ("odezhda", "obuv"):
         parent = roots[parent_slug]
         for child_slug, child_name in (("women", "Женщина"), ("men", "Мужчина")):
@@ -94,7 +110,7 @@ def health():
 
 
 # ----------------------------
-# Media Upload
+# Media Upload (auth + owner_id)
 # ----------------------------
 
 class UploadResp(BaseModel):
@@ -105,7 +121,11 @@ class UploadResp(BaseModel):
 
 
 @app.post("/v1/media/upload", response_model=UploadResp)
-async def upload_media(file: UploadFile = File(...)):
+async def upload_media(
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current: User = Depends(get_current_user),
+):
     if not file.content_type or not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="Only image uploads are supported")
 
@@ -115,27 +135,24 @@ async def upload_media(file: UploadFile = File(...)):
 
     media_id = str(uuid.uuid4())
     ext = guess_ext(file.filename) or "jpg"
-    object_key = f"original/{media_id}.{ext}"
-
     bucket = os.getenv("MINIO_BUCKET", "products")
 
-    # Загрузка в MinIO
-    put_object(object_key=object_key, data=data, content_type=file.content_type)
+    # ✅ разделяем пользователей в object_key
+    object_key = f"{current.id}/original/{media_id}.{ext}"
 
-    # URL всегда отдаём через Nginx /media/
+    put_object(object_key=object_key, data=data, content_type=file.content_type)
     url = f"/media/{bucket}/{object_key}"
 
-    # Записываем метаданные в БД
-    with SessionLocal() as db:
-        m = Media(
-            id=media_id,
-            bucket=bucket,
-            object_key=object_key,
-            content_type=file.content_type,
-            created_at=datetime.utcnow(),
-        )
-        db.add(m)
-        db.commit()
+    m = Media(
+        id=media_id,
+        owner_id=current.id,
+        bucket=bucket,
+        object_key=object_key,
+        content_type=file.content_type,
+        created_at=datetime.utcnow(),
+    )
+    db.add(m)
+    db.commit()
 
     return UploadResp(media_id=media_id, bucket=bucket, object_key=object_key, url=url)
 
@@ -150,7 +167,7 @@ def guess_ext(filename: Optional[str]) -> Optional[str]:
 
 
 # ----------------------------
-# AI Jobs
+# AI Jobs (auth + owner_id)
 # ----------------------------
 
 class CreateJobReq(BaseModel):
@@ -164,30 +181,32 @@ class CreateJobResp(BaseModel):
 
 
 @app.post("/v1/ai/jobs", response_model=CreateJobResp)
-def create_ai_job(payload: CreateJobReq):
+def create_ai_job(
+    payload: CreateJobReq,
+    db: Session = Depends(get_db),
+    current: User = Depends(get_current_user),
+):
+    media = db.query(Media).filter(Media.id == payload.media_id).first()
+    if not media or media.owner_id != current.id:
+        raise HTTPException(status_code=404, detail="media_id not found")
+
     job_id = str(uuid.uuid4())
+    job = AIJob(
+        id=job_id,
+        owner_id=current.id,
+        status="queued",
+        media_id=media.id,
+        hint=payload.hint or {},
+        result_json=None,
+        error=None,
+        model_version="stub-v1",
+        draft_product_id=None,
+        created_at=datetime.utcnow(),
+        updated_at=datetime.utcnow(),
+    )
+    db.add(job)
+    db.commit()
 
-    with SessionLocal() as db:
-        media = db.query(Media).filter(Media.id == payload.media_id).first()
-        if not media:
-            raise HTTPException(status_code=404, detail="media_id not found")
-
-        job = AIJob(
-            id=job_id,
-            status="queued",
-            media_id=media.id,
-            hint=payload.hint or {},
-            result_json=None,
-            error=None,
-            model_version="stub-v1",
-            draft_product_id=None,
-            created_at=datetime.utcnow(),
-            updated_at=datetime.utcnow(),
-        )
-        db.add(job)
-        db.commit()
-
-    # enqueue в Redis очередь (worker обработает)
     enqueue_process_job(job_id)
     return CreateJobResp(job_id=job_id, status="queued")
 
@@ -201,53 +220,49 @@ class JobResp(BaseModel):
 
 
 @app.get("/v1/ai/jobs/{job_id}", response_model=JobResp)
-def get_ai_job(job_id: str):
-    with SessionLocal() as db:
-        job = db.query(AIJob).filter(AIJob.id == job_id).first()
-        if not job:
-            raise HTTPException(status_code=404, detail="job not found")
+def get_ai_job(
+    job_id: str,
+    db: Session = Depends(get_db),
+    current: User = Depends(get_current_user),
+):
+    job = db.query(AIJob).filter(AIJob.id == job_id).first()
+    if not job or job.owner_id != current.id:
+        raise HTTPException(status_code=404, detail="job not found")
 
-        return JobResp(
-            job_id=job.id,
-            status=job.status,
-            result=job.result_json,
-            error=job.error,
-            draft_product_id=job.draft_product_id,
-        )
+    return JobResp(
+        job_id=job.id,
+        status=job.status,
+        result=job.result_json,
+        error=job.error,
+        draft_product_id=job.draft_product_id,
+    )
 
 
 # ----------------------------
-# Categories
+# Categories (global, можно без auth)
 # ----------------------------
 
 @app.get("/v1/categories/tree")
-def categories_tree():
-    with SessionLocal() as db:
-        cats = db.query(Category).all()
+def categories_tree(db: Session = Depends(get_db)):
+    cats = db.query(Category).all()
 
-        nodes = {
-            c.id: {
-                "id": c.id,
-                "name": c.name,
-                "slug": c.slug,
-                "path": c.path,
-                "children": [],
-            }
-            for c in cats
-        }
+    nodes = {
+        c.id: {"id": c.id, "name": c.name, "slug": c.slug, "path": c.path, "children": []}
+        for c in cats
+    }
 
-        root = []
-        for c in cats:
-            if c.parent_id and c.parent_id in nodes:
-                nodes[c.parent_id]["children"].append(nodes[c.id])
-            else:
-                root.append(nodes[c.id])
+    root = []
+    for c in cats:
+        if c.parent_id and c.parent_id in nodes:
+            nodes[c.parent_id]["children"].append(nodes[c.id])
+        else:
+            root.append(nodes[c.id])
 
-        return {"items": root}
+    return {"items": root}
 
 
 # ----------------------------
-# Products
+# Products (auth + owner_id)
 # ----------------------------
 
 class ProductPatch(BaseModel):
@@ -260,63 +275,76 @@ class ProductPatch(BaseModel):
 
 
 @app.get("/v1/products/{product_id}")
-def get_product(product_id: str):
-    with SessionLocal() as db:
-        p = db.query(Product).filter(Product.id == product_id).first()
-        if not p:
-            raise HTTPException(status_code=404, detail="product not found")
+def get_product(
+    product_id: str,
+    db: Session = Depends(get_db),
+    current: User = Depends(get_current_user),
+):
+    p = db.query(Product).filter(Product.id == product_id).first()
+    if not p or p.owner_id != current.id:
+        raise HTTPException(status_code=404, detail="product not found")
 
-        media = db.query(ProductMedia).filter(ProductMedia.product_id == p.id).all()
+    media = db.query(ProductMedia).filter(ProductMedia.product_id == p.id).all()
 
-        return {
-            "id": p.id,
-            "status": p.status,
-            "title": p.title,
-            "description": p.description,
-            "category_id": p.category_id,
-            "attributes": p.attributes or {},
-            "tags": p.tags or [],
-            "media": [{"id": m.id, "url": f"/media/{m.bucket}/{m.object_key}", "kind": m.kind} for m in media],
-            "created_at": p.created_at.isoformat() if p.created_at else None,
-            "updated_at": p.updated_at.isoformat() if p.updated_at else None,
-        }
+    return {
+        "id": p.id,
+        "status": p.status,
+        "title": p.title,
+        "description": p.description,
+        "category_id": p.category_id,
+        "attributes": p.attributes or {},
+        "tags": p.tags or [],
+        "media": [
+            {"id": m.id, "url": f"/media/{m.bucket}/{m.object_key}", "kind": m.kind}
+            for m in media
+        ],
+        "created_at": p.created_at.isoformat() if p.created_at else None,
+        "updated_at": p.updated_at.isoformat() if p.updated_at else None,
+    }
 
 
 @app.patch("/v1/products/{product_id}")
-def patch_product(product_id: str, patch: ProductPatch):
-    with SessionLocal() as db:
-        p = db.query(Product).filter(Product.id == product_id).first()
-        if not p:
-            raise HTTPException(status_code=404, detail="product not found")
+def patch_product(
+    product_id: str,
+    patch: ProductPatch,
+    db: Session = Depends(get_db),
+    current: User = Depends(get_current_user),
+):
+    p = db.query(Product).filter(Product.id == product_id).first()
+    if not p or p.owner_id != current.id:
+        raise HTTPException(status_code=404, detail="product not found")
 
-        if patch.title is not None:
-            p.title = patch.title
-        if patch.description is not None:
-            p.description = patch.description
-        if patch.category_id is not None:
-            p.category_id = patch.category_id
-        if patch.attributes is not None:
-            p.attributes = patch.attributes
-        if patch.tags is not None:
-            p.tags = patch.tags
-        if patch.status is not None:
-            p.status = patch.status
+    if patch.title is not None:
+        p.title = patch.title
+    if patch.description is not None:
+        p.description = patch.description
+    if patch.category_id is not None:
+        p.category_id = patch.category_id
+    if patch.attributes is not None:
+        p.attributes = patch.attributes
+    if patch.tags is not None:
+        p.tags = patch.tags
+    if patch.status is not None:
+        p.status = patch.status
 
-        p.updated_at = datetime.utcnow()
-        db.commit()
-        return {"status": "ok"}
+    p.updated_at = datetime.utcnow()
+    db.commit()
+    return {"status": "ok"}
 
 
 @app.post("/v1/products/{product_id}/publish")
-def publish_product(product_id: str):
-    with SessionLocal() as db:
-        p = db.query(Product).filter(Product.id == product_id).first()
-        if not p:
-            raise HTTPException(status_code=404, detail="product not found")
+def publish_product(
+    product_id: str,
+    db: Session = Depends(get_db),
+    current: User = Depends(get_current_user),
+):
+    p = db.query(Product).filter(Product.id == product_id).first()
+    if not p or p.owner_id != current.id:
+        raise HTTPException(status_code=404, detail="product not found")
 
-        p.status = "published"
-        p.updated_at = datetime.utcnow()
-        db.commit()
+    p.status = "published"
+    p.updated_at = datetime.utcnow()
+    db.commit()
 
     # Индексация в Meili — через очередь (worker)
     enqueue_index_product(product_id)

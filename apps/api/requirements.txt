@@ -9,9 +9,14 @@ redis==5.2.0
 rq==1.16.2
 
 minio==7.2.15
-
 meilisearch==0.31.5
 
 pydantic-settings==2.6.1
 python-multipart==0.0.12
 requests==2.32.3
+
+passlib[bcrypt]==1.7.4
+bcrypt==4.0.1
+python-jose[cryptography]==3.3.0
+email-validator==2.2.0
+python-dotenv==1.0.1
