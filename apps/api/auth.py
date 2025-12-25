@@ -127,28 +127,51 @@ class MeResp(BaseModel):
 @router.post("/register", response_model=AuthResp)
 def register(payload: RegisterReq, db: Session = Depends(get_db)):
     email = payload.email.strip().lower()
-    password = payload.password
-
-    if len(password) < 8:
+    if len(payload.password) < 8:
         raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
 
-    exists = db.query(User).filter(User.email == email).first()
-    if exists:
+    now = datetime.utcnow()
+    user = db.query(User).filter(User.email == email).first()
+
+    # 1) Уже существует и активен
+    if user and user.deleted_at is None and user.is_active:
         raise HTTPException(status_code=409, detail="Email already registered")
 
-    u = User(
-        id=str(uuid.uuid4()),
-        email=email,
-        password_hash=hash_password(password),
-        is_active=True,
-        deleted_at=None,
-        created_at=datetime.utcnow(),
-        updated_at=None,
-    )
-    db.add(u)
-    db.commit()
+    # 2) Существует, но был soft-delete / выключен — восстановим
+    if user:
+        user.password_hash = hash_password(payload.password)
+        user.is_active = True
+        user.deleted_at = None
+        if hasattr(user, "updated_at"):
+            user.updated_at = now
+        db.commit()
+        db.refresh(user)
+    else:
+        # 3) Новый пользователь
+        user = User(
+            id=str(uuid.uuid4()),
+            email=email,
+            password_hash=hash_password(payload.password),
+            is_active=True,
+            created_at=now,
+            deleted_at=None,
+        )
+        if hasattr(user, "updated_at"):
+            user.updated_at = now
+        db.add(user)
+        db.commit()
+        db.refresh(user)
 
-    return AuthResp(access_token=create_access_token(sub=u.id))
+    token = create_access_token(sub=user.id)
+    return AuthResp(
+        access_token=token,
+        token_type="bearer",
+        user={
+            "id": user.id,
+            "email": user.email,
+            "created_at": user.created_at.isoformat() if user.created_at else None,
+        },
+    )
 
 
 @router.post("/login", response_model=AuthResp)
