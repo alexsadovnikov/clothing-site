@@ -9,7 +9,6 @@ DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is not set (check .env and docker compose env_file)")
 
-# pool_pre_ping помогает при разрывах соединения с Postgres
 engine = create_engine(
     DATABASE_URL,
     pool_pre_ping=True,
@@ -24,23 +23,21 @@ SessionLocal = sessionmaker(
 )
 
 # Важно: импорт после engine/sessionmaker (во избежание циклических импортов)
+import models  # noqa: E402,F401  (важно: загружаем модели)
 from models import Base  # noqa: E402
 
 
 def init_db() -> None:
     """
-    MVP режим:
-    создаём таблицы напрямую (без alembic миграций).
+    DEV/MVP fallback режим:
+    Создание таблиц напрямую ТОЛЬКО по флагу.
+    По умолчанию используем Alembic миграции.
     """
-    Base.metadata.create_all(bind=engine)
+    if os.getenv("AUTO_CREATE_DB", "0") == "1":
+        Base.metadata.create_all(bind=engine)
 
 
 def get_db() -> Generator[Session, None, None]:
-    """
-    FastAPI dependency:
-    - отдаёт SQLAlchemy Session
-    - гарантирует закрытие сессии в конце запроса
-    """
     db: Session = SessionLocal()
     try:
         yield db

@@ -1,5 +1,6 @@
 import os
 import uuid
+import logging
 from datetime import datetime
 from typing import Any, Optional
 
@@ -7,15 +8,19 @@ from fastapi import FastAPI, File, UploadFile, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
+from sqlalchemy import text
+from sqlalchemy.exc import OperationalError, ProgrammingError
 
+from db import get_db, SessionLocal  # ✅ ВАЖНО: вернуть get_db и SessionLocal
 from storage import ensure_bucket, put_object
-from db import init_db, get_db, SessionLocal
 from models import Category, Media, AIJob, Product, ProductMedia, User
 from queueing import enqueue_process_job, enqueue_index_product
 from search_routes import router as catalog_router
 
-# ✅ Роуты авторизации должны быть в apps/api/auth.py (никакого auth_routes.py)
+# ✅ Роуты авторизации должны быть в apps/api/auth.py
 from auth import router as auth_router, get_current_user  # type: ignore
+
+logger = logging.getLogger(__name__)
 
 
 def _parse_cors_origins() -> list[str]:
@@ -48,13 +53,27 @@ app.add_middleware(
 
 @app.on_event("startup")
 def _startup():
-    init_db()
-    ensure_bucket()
+    # MinIO bucket (может упасть если MinIO не готов — это ок, но лучше логировать)
+    try:
+        ensure_bucket()
+    except Exception as e:
+        logger.warning("ensure_bucket failed on startup: %s", e)
 
-    # Seed категорий: только если пусто (категории глобальные, общие для всех)
-    with SessionLocal() as db:
-        if db.query(Category).count() == 0:
-            seed_categories(db)
+    # Seed категорий: только если таблицы уже созданы миграциями и категорий нет
+    try:
+        with SessionLocal() as db:
+            # если таблицы ещё не созданы (после down -v), не падаем в restart-loop
+            try:
+                db.execute(text("SELECT 1 FROM categories LIMIT 1"))
+            except (ProgrammingError, OperationalError) as e:
+                logger.warning("DB schema not ready yet (skip seeding categories): %s", e)
+                return
+
+            if db.query(Category).count() == 0:
+                seed_categories(db)
+
+    except Exception as e:
+        logger.warning("startup seeding failed: %s", e)
 
 
 def seed_categories(db: Session) -> None:
@@ -137,7 +156,6 @@ async def upload_media(
     ext = guess_ext(file.filename) or "jpg"
     bucket = os.getenv("MINIO_BUCKET", "products")
 
-    # ✅ разделяем пользователей в object_key
     object_key = f"{current.id}/original/{media_id}.{ext}"
 
     put_object(object_key=object_key, data=data, content_type=file.content_type)
@@ -346,6 +364,5 @@ def publish_product(
     p.updated_at = datetime.utcnow()
     db.commit()
 
-    # Индексация в Meili — через очередь (worker)
     enqueue_index_product(product_id)
     return {"status": "ok", "product_id": product_id}
