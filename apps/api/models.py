@@ -85,6 +85,7 @@ class Media(Base):
 
 
 # ---------------- Products ----------------
+# (по смыслу это "вещи" в гардеробе)
 
 class Product(Base):
     __tablename__ = "products"
@@ -126,6 +127,69 @@ class ProductMedia(Base):
 
     __table_args__ = (
         Index("ix_product_media_product_id", "product_id"),
+    )
+
+
+# ---------------- Looks (Outfits) ----------------
+# Аутфиты/образы пользователя
+
+class Look(Base):
+    __tablename__ = "looks"
+
+    id = Column(String, primary_key=True)
+
+    owner_id = Column(String, ForeignKey("users.id"), nullable=False, index=True)
+
+    title = Column(String, nullable=True)
+    occasion = Column(String, nullable=True)  # work/date/travel/party/etc
+    season = Column(String, nullable=True)    # winter/summer/demi/all
+
+    created_at = Column(DateTime, nullable=True)
+    updated_at = Column(DateTime, nullable=True)
+
+    __table_args__ = (
+        Index("ix_looks_owner_created", "owner_id", "created_at"),
+        Index("ix_looks_owner_updated", "owner_id", "updated_at"),
+    )
+
+
+class LookItem(Base):
+    __tablename__ = "look_items"
+
+    id = Column(String, primary_key=True)
+
+    look_id = Column(String, ForeignKey("looks.id"), nullable=False)
+    product_id = Column(String, ForeignKey("products.id"), nullable=False)
+
+    created_at = Column(DateTime, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint("look_id", "product_id", name="uq_look_items_look_product"),
+        Index("ix_look_items_look_id", "look_id"),
+        Index("ix_look_items_product_id", "product_id"),
+    )
+
+
+# ---------------- Wear log ----------------
+# История носки (для аналитики: "давно не носил", "топ вещей", и т.д.)
+
+class WearLog(Base):
+    __tablename__ = "wear_log"
+
+    id = Column(String, primary_key=True)
+
+    owner_id = Column(String, ForeignKey("users.id"), nullable=False, index=True)
+    product_id = Column(String, ForeignKey("products.id"), nullable=False)
+
+    worn_at = Column(DateTime, nullable=False)
+    context = Column(String, nullable=True)  # work/date/travel/etc (опционально)
+    notes = Column(Text, nullable=True)
+
+    created_at = Column(DateTime, nullable=True)
+
+    __table_args__ = (
+        Index("ix_wear_log_owner_worn_at", "owner_id", "worn_at"),
+        Index("ix_wear_log_product_worn_at", "product_id", "worn_at"),
     )
 
 
