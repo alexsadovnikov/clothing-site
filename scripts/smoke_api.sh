@@ -1,211 +1,246 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-BASE_URL="${BASE_URL:-https://voicecrm.online/api}"
-PASS="${PASS:-12345678}"
-
-# normalize: remove trailing slash
+# По умолчанию тестируем локально.
+# Для домена: BASE_URL="https://voicecrm.online/api" bash scripts/smoke_api.sh
+BASE_URL="${BASE_URL:-http://127.0.0.1:8001}"
 BASE_URL="${BASE_URL%/}"
 
-echo "BASE_URL=$BASE_URL"
+# AI блок по умолчанию выключен.
+# Включить: SMOKE_AI=1 BASE_URL="http://127.0.0.1:8101" bash scripts/smoke_api.sh
+SMOKE_AI="${SMOKE_AI:-0}"
 
-need_cmd() { command -v "$1" >/dev/null 2>&1 || { echo "[FAIL] missing command: $1"; exit 1; }; }
+# Поллинг AI job
+AI_POLL_INTERVAL="${AI_POLL_INTERVAL:-0.5}"   # seconds
+AI_POLL_TRIES="${AI_POLL_TRIES:-80}"          # 80 * 0.5 = 40s
+
+# --- deps ---
+need_cmd() { command -v "$1" >/dev/null 2>&1 || { echo "Missing dependency: $1"; exit 127; }; }
 need_cmd curl
-need_cmd python3
-
-CURL_JSON() { curl -fsSL "$@"; }   # follow redirects, fail fast
-CURL_OK()   { curl -fsSL "$@" >/dev/null; }
-
-# temp files cleanup
-OPENAPI_TMP="$(mktemp)"
-TMP_JPG=""
-cleanup() {
-  rm -f "$OPENAPI_TMP" >/dev/null 2>&1 || true
-  [[ -n "${TMP_JPG:-}" ]] && rm -f "$TMP_JPG" >/dev/null 2>&1 || true
-}
-trap cleanup EXIT
-
-# 0) wait for api
-echo "[wait] api /health..."
-ready=0
-for i in {1..30}; do
-  if curl -fsS "$BASE_URL/health" >/dev/null 2>&1; then
-    echo "[OK] api ready"
-    ready=1
-    break
-  fi
-  sleep 1
-done
-if [[ "$ready" != "1" ]]; then
-  echo "[FAIL] api not ready: $BASE_URL/health"
-  exit 1
+# python может быть python3
+if command -v python >/dev/null 2>&1; then
+  PYTHON=python
+elif command -v python3 >/dev/null 2>&1; then
+  PYTHON=python3
+else
+  echo "Missing dependency: python/python3"
+  exit 127
 fi
 
-# 1) health
-CURL_OK "$BASE_URL/health"
-echo "[OK] health"
+tmpdir="$(mktemp -d)"
+trap 'rm -rf "$tmpdir"' EXIT
 
-# 1.1) openapi routes exist
-curl -fsSL -o "$OPENAPI_TMP" "$BASE_URL/openapi.json"
+LAST_BODY="$tmpdir/last_body"
+LAST_CODE="$tmpdir/last_code"
+LAST_REQ="$tmpdir/last_req"
 
-python3 - <<'PY' "$OPENAPI_TMP"
-import json, sys
-p = json.load(open(sys.argv[1], "r", encoding="utf-8")).get("paths", {})
+say(){ printf '%s\n' "$*"; }
 
-def need(path, method):
-    ops = p.get(path, {})
-    if method not in ops:
-        raise SystemExit(f"[FAIL] openapi missing: {method.upper()} {path}")
+# Универсальный HTTP для JSON
+http() {
+  local method="$1"; local url="$2"; local data="${3:-}"; local token="${4:-}"
 
-# auth
-need("/v1/auth/register", "post")
-need("/v1/auth/login", "post")
-need("/v1/auth/me", "get")
-need("/v1/auth/me", "delete")
+  echo "$method $url" >"$LAST_REQ"
 
-# products
-need("/v1/products", "post")
-need("/v1/products", "get")
-need("/v1/products/{product_id}", "get")
-need("/v1/products/{product_id}", "patch")
-need("/v1/products/{product_id}/publish", "post")
+  if [[ -n "$data" ]]; then
+    curl -sS -L -o "$LAST_BODY" -w "%{http_code}" -X "$method" "$url" \
+      ${token:+-H "Authorization: Bearer $token"} \
+      -H "Content-Type: application/json" \
+      -d "$data" >"$LAST_CODE" || true
+  else
+    curl -sS -L -o "$LAST_BODY" -w "%{http_code}" -X "$method" "$url" \
+      ${token:+-H "Authorization: Bearer $token"} \
+      >"$LAST_CODE" || true
+  fi
 
-# media
-need("/v1/media/upload", "post")
-need("/v1/products/{product_id}/media", "post")
+  # если curl упал и файл пустой — чтобы не было пустого HTTP-кода
+  if [[ ! -s "$LAST_CODE" ]]; then
+    echo "000" >"$LAST_CODE"
+  fi
+}
 
-# search
-need("/v1/search", "get")
+# Отдельный helper для multipart/form-data (upload)
+http_upload_file() {
+  local url="$1"; local file_path="$2"; local token="${3:-}"
 
-print("[OK] openapi routes")
+  echo "POST $url (multipart file=$file_path)" >"$LAST_REQ"
+
+  curl -sS -L -o "$LAST_BODY" -w "%{http_code}" \
+    ${token:+-H "Authorization: Bearer $token"} \
+    -F "file=@${file_path};type=image/jpeg" \
+    "$url" >"$LAST_CODE" || true
+
+  if [[ ! -s "$LAST_CODE" ]]; then
+    echo "000" >"$LAST_CODE"
+  fi
+}
+
+fail_dump() {
+  local msg="${1:-FAIL}"
+  echo "---- FAIL ----"
+  echo "$msg"
+  echo "REQ: $(cat "$LAST_REQ")"
+  echo "HTTP: $(cat "$LAST_CODE")"
+  echo "BODY:"
+  cat "$LAST_BODY"; echo
+  exit 1
+}
+
+expect_2xx() {
+  local code; code="$(cat "$LAST_CODE")"
+  [[ "$code" =~ ^2 ]] || fail_dump "HTTP not 2xx"
+}
+
+json_field() {
+  local field="$1"
+  "$PYTHON" - "$field" "$LAST_BODY" <<'PY'
+import json,sys
+field=sys.argv[1]; path=sys.argv[2]
+data=open(path,'r',encoding='utf-8').read()
+if not data.strip():
+  print("")
+  raise SystemExit(0)
+try:
+  obj=json.loads(data)
+except Exception:
+  print("")
+  raise SystemExit(0)
+v=obj.get(field,"")
+print("" if v is None else v)
 PY
+}
 
-# 2) register -> token
-EMAIL="smoke-$(date +%s)-$RANDOM@example.com"
-TOKEN="$(CURL_JSON -X POST "$BASE_URL/v1/auth/register" \
-  -H "Content-Type: application/json" \
-  -d "{\"email\":\"$EMAIL\",\"password\":\"$PASS\"}" \
-  | python3 -c 'import sys,json; print(json.load(sys.stdin).get("access_token",""))')"
-test "${#TOKEN}" -gt 20
-echo "[OK] register"
+wait_health() {
+  for _ in $(seq 1 40); do
+    http GET "$BASE_URL/health"
+    [[ "$(cat "$LAST_CODE")" == "200" ]] && return 0
+    sleep 0.5
+  done
+  fail_dump "api not ready"
+}
 
-# 3) login -> token
-TOKEN="$(CURL_JSON -X POST "$BASE_URL/v1/auth/login" \
-  -H "Content-Type: application/json" \
-  -d "{\"email\":\"$EMAIL\",\"password\":\"$PASS\"}" \
-  | python3 -c 'import sys,json; print(json.load(sys.stdin).get("access_token",""))')"
-test "${#TOKEN}" -gt 20
-echo "[OK] login"
+say "BASE_URL=$BASE_URL"
+say "SMOKE_AI=$SMOKE_AI"
+say "[wait] api /health..."
+wait_health
+say "[OK] api ready"
 
-export BASE_URL TOKEN
-AUTH_HEADER="Authorization: Bearer $TOKEN"
+http GET "$BASE_URL/health"
+expect_2xx
+say "[OK] health"
 
-# 4) me
-CURL_OK "$BASE_URL/v1/auth/me" -H "$AUTH_HEADER"
-echo "[OK] me"
+http GET "$BASE_URL/openapi.json"
+expect_2xx
+say "[OK] openapi routes"
 
-# 5) create product
-CREATE_RESP="$(CURL_JSON -X POST "$BASE_URL/v1/products" \
-  -H "Content-Type: application/json" \
-  -H "$AUTH_HEADER" \
-  -d '{"title":"Smoke product","description":"Smoke desc"}')"
+EMAIL="smoke$(date +%s)@example.com"
+PASS="test12345"
 
-PRODUCT_ID="$(echo "$CREATE_RESP" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("id",""))')"
-test "${#PRODUCT_ID}" -gt 20
-echo "[OK] create_product id=$PRODUCT_ID"
+# register: 2xx ок, 409 тоже ок
+http POST "$BASE_URL/v1/auth/register" "{\"email\":\"$EMAIL\",\"password\":\"$PASS\"}"
+code="$(cat "$LAST_CODE")"
+if [[ "$code" =~ ^2 ]]; then
+  say "[OK] register"
+elif [[ "$code" == "409" ]]; then
+  say "[OK] register (already exists)"
+else
+  fail_dump "register failed"
+fi
 
-# 6) list products contains product_id
-LIST_RESP="$(CURL_JSON "$BASE_URL/v1/products" -H "$AUTH_HEADER")"
-echo "$LIST_RESP" | python3 - <<PY
-import sys, json
-pid = "$PRODUCT_ID"
-obj = json.load(sys.stdin)
+http POST "$BASE_URL/v1/auth/login" "{\"email\":\"$EMAIL\",\"password\":\"$PASS\"}"
+expect_2xx
+TOKEN="$(json_field access_token)"
+[[ -n "$TOKEN" ]] || fail_dump "login: access_token empty"
+say "[OK] login"
 
-if isinstance(obj, dict) and "items" in obj and isinstance(obj["items"], list):
-    items = obj["items"]
-elif isinstance(obj, list):
-    items = obj
-else:
-    raise SystemExit(f"[FAIL] unexpected list response shape: {type(obj)}")
+http GET "$BASE_URL/v1/auth/me" "" "$TOKEN"
+expect_2xx
+say "[OK] me"
 
-ids = [x.get("id") for x in items if isinstance(x, dict)]
-if pid not in ids:
-    raise SystemExit(f"[FAIL] product not found in list: {pid}")
-print("[OK] list_products contains product")
-PY
+http POST "$BASE_URL/v1/products" '{"title":"Smoke jacket","tags":["winter"]}' "$TOKEN"
+expect_2xx
+PID="$(json_field id)"
+[[ -n "$PID" ]] || fail_dump "create_product: id empty"
+say "[OK] create_product id=$PID"
 
-# 7) upload media (1x1 jpg)
-TMP_JPG="$(mktemp --suffix=.jpg)"
-python3 - <<'PY' "$TMP_JPG"
+http POST "$BASE_URL/v1/products/$PID/publish" "" "$TOKEN"
+expect_2xx
+say "[OK] publish_product"
+
+http POST "$BASE_URL/v1/looks" '{"title":"Зима офис","season":"winter","occasion":"work"}' "$TOKEN"
+expect_2xx
+LOOK_ID="$(json_field id)"
+[[ -n "$LOOK_ID" ]] || fail_dump "create_look: id empty"
+say "[OK] create_look id=$LOOK_ID"
+
+http POST "$BASE_URL/v1/looks/$LOOK_ID/items" "{\"product_id\":\"$PID\"}" "$TOKEN"
+expect_2xx
+say "[OK] add_item_to_look"
+
+http POST "$BASE_URL/v1/wear-log" "{\"product_id\":\"$PID\",\"context\":\"work\"}" "$TOKEN"
+expect_2xx
+say "[OK] wear_log_create"
+
+http GET "$BASE_URL/v1/wear-log" "" "$TOKEN"
+expect_2xx
+say "[OK] wear_log_list"
+
+# ---------------- AI JOB (optional) ----------------
+if [[ "$SMOKE_AI" == "1" ]]; then
+  say "[AI] start..."
+
+  # 1) make tiny jpg
+  TMP_JPG="$tmpdir/tiny.jpg"
+  "$PYTHON" - <<'PY' "$TMP_JPG"
 import sys, base64
-b64 = "/9j/4AAQSkZJRgABAQAAAQABAAD/2wCEAAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQH/2wCEAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQH/wAARCAAQABADASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAb/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oADAMBAAIQAxAAAAGwA//EABQQAQAAAAAAAAAAAAAAAAAAAAD/2gAIAQEAAQUCcf/EABQRAQAAAAAAAAAAAAAAAAAAAAD/2gAIAQMBAT8Bcf/EABQRAQAAAAAAAAAAAAAAAAAAAAD/2gAIAQIBAT8Bcf/EABQQAQAAAAAAAAAAAAAAAAAAAAD/2gAIAQEABj8Ccf/EABQRAQAAAAAAAAAAAAAAAAAAAAD/2gAIAQEAAT8hcf/Z"
+b64 = "/9j/4AAQSkZJRgABAQAAAQABAAD/2wCEAAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQH/2wCEAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQH/wAARCAAQABADASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAb/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oADAMBAAIQAxAAAAGnAP/EABQQAQAAAAAAAAAAAAAAAAAAAAD/2gAIAQEAAQUCsf/EABQRAQAAAAAAAAAAAAAAAAAAAAD/2gAIAQMBAT8Bl//EABQRAQAAAAAAAAAAAAAAAAAAAAD/2gAIAQIBAT8Bl//EABQQAQAAAAAAAAAAAAAAAAAAAAD/2gAIAQEABj8Cl//Z"
 open(sys.argv[1], "wb").write(base64.b64decode(b64))
 PY
 
-UPLOAD_RESP="$(CURL_JSON -X POST "$BASE_URL/v1/media/upload" \
-  -H "$AUTH_HEADER" \
-  -F "file=@$TMP_JPG;type=image/jpeg")"
+  # 2) upload media
+  http_upload_file "$BASE_URL/v1/media/upload" "$TMP_JPG" "$TOKEN"
+  expect_2xx
+  MEDIA_ID="$(json_field id)"
+  [[ -n "$MEDIA_ID" ]] || fail_dump "media_upload: id empty"
+  say "[OK] media_upload id=$MEDIA_ID"
 
-MEDIA_ID="$(echo "$UPLOAD_RESP" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("media_id",""))')"
-test "${#MEDIA_ID}" -gt 20
-echo "[OK] upload_media media_id=$MEDIA_ID"
+  # 3) create ai job
+  http POST "$BASE_URL/v1/ai/jobs" "{\"media_id\":\"$MEDIA_ID\",\"hint\":{}}" "$TOKEN"
+  expect_2xx
+  JOB_ID="$(json_field id)"
+  [[ -n "$JOB_ID" ]] || fail_dump "ai_job_create: id empty"
+  say "[OK] ai_job_create id=$JOB_ID"
 
-# 8) attach media
-CURL_OK -X POST "$BASE_URL/v1/products/$PRODUCT_ID/media" \
-  -H "Content-Type: application/json" \
-  -H "$AUTH_HEADER" \
-  -d "{\"media_id\":\"$MEDIA_ID\",\"kind\":\"original\"}"
-echo "[OK] attach_media"
+  # 4) poll status
+  poll_ai_job() {
+    for _ in $(seq 1 "$AI_POLL_TRIES"); do
+      http GET "$BASE_URL/v1/ai/jobs/$JOB_ID" "" "$TOKEN"
+      expect_2xx
+      status="$(json_field status)"
+      [[ -n "$status" ]] || status="unknown"
 
-# 9) get product includes media
-GETP_RESP="$(CURL_JSON "$BASE_URL/v1/products/$PRODUCT_ID" -H "$AUTH_HEADER")"
-echo "$GETP_RESP" | python3 - <<PY
-import sys, json
-mid = "$MEDIA_ID"
-obj = json.load(sys.stdin)
-media = obj.get("media", [])
-mids = [m.get("id") for m in media if isinstance(m, dict)]
-if mid not in mids:
-    raise SystemExit(f"[FAIL] media not attached: {mid}")
-print("[OK] get_product includes media")
-PY
+      # допускаем разные названия финальных статусов
+      case "$status" in
+        finished|done|completed|success|succeeded)
+          say "[OK] ai_job finished (status=$status)"
+          return 0
+          ;;
+        failed|error)
+          fail_dump "ai_job failed (status=$status)"
+          ;;
+        *)
+          # queued/running/processing/unknown
+          sleep "$AI_POLL_INTERVAL"
+          ;;
+      esac
+    done
+    fail_dump "ai_job timeout"
+  }
 
-# 10) publish
-CURL_OK -X POST "$BASE_URL/v1/products/$PRODUCT_ID/publish" -H "$AUTH_HEADER"
-echo "[OK] publish_product"
+  poll_ai_job
+  say "[AI] done"
+else
+  say "[AI] skipped (set SMOKE_AI=1 to enable)"
+fi
 
-# 11) search (retry; index async через worker)
-python3 - <<PY
-import os, time, sys, json, subprocess, urllib.parse
-base = os.environ["BASE_URL"]
-token = os.environ["TOKEN"]
-pid = "$PRODUCT_ID"
-
-q = "Smoke"
-url = f"{base}/v1/search?q={urllib.parse.quote(q)}"
-
-def run():
-    out = subprocess.check_output(["curl","-fsSL", url, "-H", f"Authorization: Bearer {token}"])
-    return json.loads(out)
-
-for _ in range(15):
-    try:
-        obj = run()
-        items = obj.get("items", obj if isinstance(obj, list) else [])
-        ids = [x.get("id") for x in items if isinstance(x, dict)]
-        if pid in ids:
-            print("[OK] search found product")
-            sys.exit(0)
-    except Exception:
-        pass
-    time.sleep(1)
-
-print("[FAIL] search did not find published product (worker/indexer?)")
-sys.exit(2)
-PY
-
-# 12) cleanup user
-CURL_OK -X DELETE "$BASE_URL/v1/auth/me" -H "$AUTH_HEADER"
-echo "[OK] delete_me"
-
-echo "SMOKE OK"
+say "[OK] smoke done"

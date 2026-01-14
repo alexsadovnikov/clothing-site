@@ -1,7 +1,8 @@
 import os
+import time
 import uuid
 from datetime import datetime
-from typing import Any
+from typing import Any, Optional, Tuple
 
 import requests
 from meilisearch import Client as MeiliClient
@@ -9,6 +10,253 @@ from meilisearch import Client as MeiliClient
 from db import SessionLocal
 from models import AIJob, Media, Product, ProductMedia
 
+
+# --- Meili config ------------------------------------------------------------
+
+_MEILI_FILTERABLE = ["status", "owner_id", "category_id", "tags"]
+_MEILI_SORTABLE = ["updated_at"]
+
+
+def _meili_cfg() -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    host = os.getenv("MEILI_HOST")
+    key = os.getenv("MEILI_MASTER_KEY")
+    index_name = os.getenv("MEILI_INDEX", "products")
+    if not host or not key:
+        return None, None, None
+    return host, key, index_name
+
+
+def _task_uid(task_info) -> Optional[int]:
+    """
+    meilisearch-python в разных версиях возвращает:
+      - dict {taskUid: 12} или {uid: 12}
+      - объект TaskInfo с полями .task_uid / .uid
+    Нам нужен int task_uid.
+    """
+    if task_info is None:
+        return None
+
+    # TaskInfo object
+    for attr in ("task_uid", "taskUid", "uid"):
+        if hasattr(task_info, attr):
+            v = getattr(task_info, attr)
+            if v is not None:
+                try:
+                    return int(v)
+                except Exception:
+                    pass
+
+    # dict
+    if isinstance(task_info, dict):
+        for k in ("taskUid", "uid", "task_uid"):
+            if k in task_info and task_info[k] is not None:
+                try:
+                    return int(task_info[k])
+                except Exception:
+                    pass
+
+    return None
+
+
+def _wait_task(client: MeiliClient, task_uid: int, timeout_s: int = 30) -> bool:
+    """
+    Ждём, пока Meili применит index/settings.
+    Если не дождались — вернём False (не критично для старта воркера).
+    """
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        try:
+            t = client.get_task(task_uid)
+            status = t.get("status") if isinstance(t, dict) else getattr(t, "status", None)
+            if status in ("succeeded", "failed", "canceled"):
+                return status == "succeeded"
+        except Exception:
+            pass
+        time.sleep(0.2)
+    return False
+
+
+def _index_exists(client: MeiliClient, index_name: str) -> bool:
+    # 1) client.get_index(uid)
+    if hasattr(client, "get_index"):
+        try:
+            client.get_index(index_name)
+            return True
+        except Exception:
+            return False
+
+    # 2) client.get_indexes()
+    if hasattr(client, "get_indexes"):
+        try:
+            data = client.get_indexes()
+            if isinstance(data, dict) and "results" in data:
+                return any(
+                    isinstance(x, dict) and x.get("uid") == index_name
+                    for x in data.get("results", [])
+                )
+            if isinstance(data, list):
+                for x in data:
+                    if isinstance(x, dict) and x.get("uid") == index_name:
+                        return True
+                    if hasattr(x, "uid") and getattr(x, "uid") == index_name:
+                        return True
+            return False
+        except Exception:
+            return False
+
+    return False
+
+
+def _get_index_info(client: MeiliClient, index_name: str) -> Optional[dict]:
+    # prefer client.get_index
+    if hasattr(client, "get_index"):
+        try:
+            info = client.get_index(index_name)
+            if isinstance(info, dict):
+                return info
+            if hasattr(info, "__dict__"):
+                # ВАЖНО: тут могут быть не-JSON объекты (config/http/task_handler),
+                # но нам важны uid/primary_key/created_at/updated_at.
+                return dict(info.__dict__)
+        except Exception:
+            pass
+
+    idx = client.index(index_name)
+    for m in ("get_raw_info", "get_info"):
+        if hasattr(idx, m):
+            try:
+                res = getattr(idx, m)()
+                if isinstance(res, dict):
+                    return res
+                if hasattr(res, "__dict__"):
+                    return dict(res.__dict__)
+            except Exception:
+                pass
+    return None
+
+
+def _safe_pk_from_info(info: Optional[dict]) -> Optional[str]:
+    """
+    Meili REST: primaryKey
+    meilisearch-python (некоторые версии): primary_key
+    """
+    if not info or not isinstance(info, dict):
+        return None
+    pk = info.get("primaryKey") or info.get("primary_key") or info.get("primarykey")
+    if pk is None:
+        return None
+    try:
+        return str(pk)
+    except Exception:
+        return None
+
+
+def _safe_settings(idx) -> dict:
+    """
+    Возвращает settings как dict, если библиотека это умеет.
+    """
+    if hasattr(idx, "get_settings"):
+        try:
+            s = idx.get_settings()
+            return s if isinstance(s, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def init_meili() -> None:
+    """
+    Вызывается при старте воркера.
+    1) гарантирует индекс (НЕ спамим create_index, если уже существует)
+    2) проверяет primaryKey
+    3) применяет settings ТОЛЬКО если отличаются
+    """
+    host, key, index_name = _meili_cfg()
+    if not host or not key or not index_name:
+        print("[meili:init] skipped: MEILI_HOST/MEILI_MASTER_KEY not set", flush=True)
+        return
+
+    client = MeiliClient(host, key)
+    exists = _index_exists(client, index_name)
+
+    # 1) создать индекс только если его нет
+    if not exists:
+        try:
+            t = client.create_index(index_name, {"primaryKey": "id"})
+            tuid = _task_uid(t)
+            if tuid:
+                _wait_task(client, tuid)
+            print(f"[meili:init] created index={index_name} with primaryKey=id", flush=True)
+            exists = True
+        except Exception as e:
+            msg = str(e).lower()
+            if "already exists" in msg:
+                print(f"[meili:init] index={index_name} already exists (race), continue", flush=True)
+                exists = True
+            else:
+                print(f"[meili:init] FAILED to create index={index_name}: {e}", flush=True)
+                return
+    else:
+        print(f"[meili:init] index={index_name} exists", flush=True)
+
+    idx = client.index(index_name)
+
+    # 2) primaryKey: просто корректно читаем и логируем (не ломаем запуск)
+    try:
+        info = _get_index_info(client, index_name) or {}
+        pk = _safe_pk_from_info(info)
+
+        if not pk:
+            # Никаких ложных PATCH: это часто артефакт библиотеки, PK при этом есть в REST.
+            print(f"[meili:init] primaryKey unknown via client lib (info keys: {list(info.keys())}); continue", flush=True)
+        elif pk != "id":
+            print(f"[meili:init] WARNING: index={index_name} primaryKey={pk} (expected id)", flush=True)
+        else:
+            print(f"[meili:init] primaryKey OK: {pk}", flush=True)
+
+    except Exception as e:
+        print(f"[meili:init] primaryKey check skipped/failed: {e}", flush=True)
+
+    # 3) settings: применять только если реально отличаются
+    try:
+        current = _safe_settings(idx)
+
+        cur_filter = current.get("filterableAttributes") or current.get("filterable_attributes") or []
+        cur_sort = current.get("sortableAttributes") or current.get("sortable_attributes") or []
+
+        def _norm(x):
+            return sorted([str(i) for i in (x or [])])
+
+        need_filter = _norm(cur_filter) != _norm(_MEILI_FILTERABLE)
+        need_sort = _norm(cur_sort) != _norm(_MEILI_SORTABLE)
+
+        tuids = []
+
+        if need_filter:
+            t1 = idx.update_filterable_attributes(_MEILI_FILTERABLE)
+            tuid1 = _task_uid(t1)
+            if tuid1:
+                tuids.append(tuid1)
+
+        if need_sort:
+            t2 = idx.update_sortable_attributes(_MEILI_SORTABLE)
+            tuid2 = _task_uid(t2)
+            if tuid2:
+                tuids.append(tuid2)
+
+        for tu in tuids:
+            _wait_task(client, tu)
+
+        if need_filter or need_sort:
+            print(f"[meili:init] settings applied for index={index_name}", flush=True)
+        else:
+            print(f"[meili:init] settings already up-to-date for index={index_name}", flush=True)
+
+    except Exception as e:
+        print(f"[meili:init] settings apply skipped/failed: {e}", flush=True)
+
+
+# --- Jobs --------------------------------------------------------------------
 
 def process_ai_job(job_id: str):
     # 1) Берём job + media и сохраняем нужные поля в простые переменные
@@ -68,7 +316,7 @@ def process_ai_job(job_id: str):
 
             p_kwargs = dict(
                 id=product_id,
-                owner_id=owner_id,          # ✅ КЛЮЧЕВОЕ
+                owner_id=owner_id,  # ✅ ключевое
                 status="draft",
                 title=title,
                 description=(result.get("description_draft") or ""),
@@ -83,7 +331,7 @@ def process_ai_job(job_id: str):
 
             p = Product(**p_kwargs)
             db.add(p)
-            db.flush()  # форсим INSERT
+            db.flush()
 
             pm_kwargs = dict(
                 id=str(uuid.uuid4()),
@@ -92,7 +340,6 @@ def process_ai_job(job_id: str):
                 object_key=object_key,
                 kind="original",
             )
-            # ⚠️ эти поля могут/не могут быть в модели — делаем безопасно
             if hasattr(ProductMedia, "content_type") and content_type:
                 pm_kwargs["content_type"] = content_type
             if hasattr(ProductMedia, "created_at"):
@@ -126,38 +373,27 @@ def process_ai_job(job_id: str):
 
 
 def index_product(product_id: str):
-    meili_host = os.getenv("MEILI_HOST")
-    meili_key = os.getenv("MEILI_MASTER_KEY")
-    index_name = os.getenv("MEILI_INDEX", "products")
-    if not meili_host or not meili_key:
+    """
+    Runtime-индексация: только add_documents(), без PK/settings.
+    Все настройки должны быть сделаны init_meili() при старте воркера.
+    """
+    host, key, index_name = _meili_cfg()
+    if not host or not key or not index_name:
         return
 
-    client = MeiliClient(meili_host, meili_key)
+    client = MeiliClient(host, key)
     idx = client.index(index_name)
-
-    # один раз выставим настройки (чтобы фильтры работали)
-    try:
-        idx.update_filterable_attributes(["status", "owner_id", "category_id", "tags"])
-        idx.update_sortable_attributes(["updated_at"])
-    except Exception:
-        pass
 
     with SessionLocal() as db:
         p = db.query(Product).filter(Product.id == product_id).first()
         if not p:
             return
 
-        # ВАЖНО ДЛЯ ГАРДЕРОБА:
-        # НЕ режем по published, потому что AI создаёт draft, а поиск нужен по всему гардеробу.
-        # Если вдруг хочешь индексировать только published — верни эту проверку обратно.
-        # if getattr(p, "status", None) != "published":
-        #     return
-
         media_rows = db.query(ProductMedia).filter(ProductMedia.product_id == p.id).all()
 
         doc = {
-            "id": p.id,
-            "owner_id": p.owner_id,
+            "id": str(p.id),
+            "owner_id": str(p.owner_id) if p.owner_id else None,
             "status": p.status,
             "title": p.title,
             "description": p.description,
@@ -178,5 +414,5 @@ def index_product(product_id: str):
 
     try:
         idx.add_documents([doc])
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[meili:index] failed for product_id={product_id}: {e}", flush=True)

@@ -1,12 +1,15 @@
 import os
 import uuid
+import time
+import hashlib
 import logging
 from datetime import datetime
 from typing import Any, Optional
 
-from fastapi import FastAPI, File, UploadFile, HTTPException, Depends, Query
+from fastapi import FastAPI, File, UploadFile, HTTPException, Depends, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field, AnyUrl
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 from sqlalchemy.exc import OperationalError, ProgrammingError
@@ -22,33 +25,108 @@ from auth import router as auth_router, get_current_user  # type: ignore
 
 logger = logging.getLogger(__name__)
 
+API_VERSION = os.getenv("API_VERSION", "1").strip() or "1"
 
-def _parse_cors_origins() -> list[str]:
+ALLOWED_IMAGE_EXTS = {"jpg", "jpeg", "png", "webp"}
+ALLOWED_IMAGE_MIME = {"image/jpeg", "image/png", "image/webp"}
+
+MAX_UPLOAD_BYTES = int(os.getenv("MAX_FILE_SIZE", str(10 * 1024 * 1024)))  # 10MB
+FORCE_WEBP = os.getenv("FORCE_WEBP", "0").strip() == "1"
+
+
+def _cors_kwargs() -> dict:
     raw = (os.getenv("CORS_ORIGINS") or "").strip()
-    if not raw:
-        return ["*"]
-    origins = [x.strip() for x in raw.split(",") if x.strip()]
-    return origins or ["*"]
+    allow_credentials_env = (os.getenv("ALLOW_CREDENTIALS") or "0").strip() == "1"
+
+    if raw == "*":
+        origins = ["*"]
+    elif raw:
+        origins = [x.strip().rstrip("/") for x in raw.split(",") if x.strip()]
+    else:
+        origins = ["https://voicecrm.online"]
+
+    allow_credentials = bool(allow_credentials_env and origins != ["*"])
+
+    return {
+        "allow_origins": origins,
+        "allow_origin_regex": r"^https?://([a-z0-9-]+\.)*(localhost|127\.0\.0\.1)(:\d+)?$",
+        "allow_credentials": allow_credentials,
+        "allow_methods": ["*"],
+        "allow_headers": ["*"],
+    }
 
 
 def _minio_bucket() -> str:
+    # bucket только из env сервиса (не из user input)
     return (os.getenv("MINIO_BUCKET") or os.getenv("MINIO_BUCKET_NAME") or "products").strip()
 
 
 app = FastAPI(title="Clothing API", version="0.1.0")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=_parse_cors_origins(),
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app.add_middleware(CORSMiddleware, **_cors_kwargs())
 
 app.include_router(auth_router)
 app.include_router(catalog_router)
 app.include_router(looks_router)
 app.include_router(wear_log_router)
+
+
+# ---------- унификация ошибок (всегда JSON) ----------
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    logger.warning(
+        "HTTPException status=%s path=%s method=%s detail=%s ip=%s ua=%s",
+        exc.status_code,
+        request.url.path,
+        request.method,
+        exc.detail,
+        request.client.host if request.client else None,
+        request.headers.get("user-agent"),
+    )
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"error": "http_error", "detail": exc.detail},
+        headers={"API-Version": API_VERSION},
+    )
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    logger.exception(
+        "Unhandled error path=%s method=%s ip=%s ua=%s",
+        request.url.path,
+        request.method,
+        request.client.host if request.client else None,
+        request.headers.get("user-agent"),
+    )
+    return JSONResponse(
+        status_code=500,
+        content={"error": "internal_error", "detail": "Internal Server Error"},
+        headers={"API-Version": API_VERSION},
+    )
+
+
+# ---------- middleware: Vary + timing + api-version ----------
+
+@app.middleware("http")
+async def add_headers_and_timing(request: Request, call_next):
+    t0 = time.perf_counter()
+    response = await call_next(request)
+
+    origin = request.headers.get("origin")
+    if origin:
+        vary = response.headers.get("Vary")
+        if vary:
+            if "Origin" not in vary:
+                response.headers["Vary"] = f"{vary}, Origin"
+        else:
+            response.headers["Vary"] = "Origin"
+
+    response.headers["API-Version"] = API_VERSION
+    response.headers["X-Response-Time-ms"] = str(int((time.perf_counter() - t0) * 1000))
+    return response
+
 
 @app.on_event("startup")
 def _startup():
@@ -62,7 +140,6 @@ def _startup():
             try:
                 db.execute(text("SELECT 1 FROM categories LIMIT 1"))
             except (OperationalError, ProgrammingError):
-                # миграции могли ещё не примениться — не падаем
                 return
 
             count = db.query(Category).count()
@@ -120,76 +197,190 @@ def seed_categories(db: Session) -> None:
     db.commit()
 
 
-@app.get("/health", operation_id="health")
+def guess_ext(filename: str | None) -> str | None:
+    if not filename or "." not in filename:
+        return None
+    ext = filename.rsplit(".", 1)[1].lower()
+    if ext in ALLOWED_IMAGE_EXTS:
+        return ext
+    return None
+
+
+def sniff_image_mime(data: bytes) -> tuple[str | None, str | None]:
+    if len(data) >= 3 and data[:3] == b"\xFF\xD8\xFF":
+        return "image/jpeg", "jpg"
+    if len(data) >= 8 and data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png", "png"
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp", "webp"
+    return None, None
+
+
+def pil_verify_image(data: bytes) -> None:
+    try:
+        from io import BytesIO
+        from PIL import Image  # type: ignore
+    except Exception:
+        # Pillow не установлен — просто пропускаем
+        return
+
+    try:
+        img = Image.open(BytesIO(data))
+        img.verify()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"invalid image content: {e}")
+
+
+def maybe_convert_to_webp(data: bytes) -> tuple[bytes, str, str]:
+    """
+    Если FORCE_WEBP=1 — пытаемся конвертить в webp.
+    ВАЖНО: если webp encoder недоступен (часто бывает) — НЕ падаем, а возвращаем оригинал.
+    """
+    sniff_mime, sniff_ext = sniff_image_mime(data)
+    if not sniff_mime or not sniff_ext:
+        return data, "application/octet-stream", "bin"
+
+    # если не форсим webp — оставляем как есть
+    if not FORCE_WEBP:
+        return data, sniff_mime, sniff_ext
+
+    # уже webp — оставляем
+    if sniff_mime == "image/webp":
+        return data, "image/webp", "webp"
+
+    try:
+        from io import BytesIO
+        from PIL import Image  # type: ignore
+
+        img = Image.open(BytesIO(data))
+        out = BytesIO()
+        img.save(out, format="WEBP", quality=85, method=6)
+        return out.getvalue(), "image/webp", "webp"
+    except Exception as e:
+        # критично: не даём 500 — просто используем оригинальный файл
+        logger.warning("webp conversion skipped (fallback to original). err=%s", e)
+        return data, sniff_mime, sniff_ext
+
+
+def put_object_with_retry(object_key: str, data: bytes, content_type: str, retries: int = 3) -> None:
+    last_err: Exception | None = None
+    for attempt in range(1, retries + 1):
+        try:
+            put_object(object_key=object_key, data=data, content_type=content_type)
+            return
+        except Exception as e:
+            last_err = e
+            logger.warning("put_object failed attempt=%s/%s key=%s err=%s", attempt, retries, object_key, e)
+            time.sleep(0.2 * attempt)
+    raise HTTPException(status_code=503, detail=f"storage unavailable: {last_err}")
+
+
+@app.get("/health", operation_id="health", response_model=dict)
 def health():
     return {"status": "ok"}
 
 
 class UploadResp(BaseModel):
-    id: str
-    bucket: str
-    object_key: str
-    url: str
-    content_type: str | None = None
-
-
-def guess_ext(filename: str | None) -> str | None:
-    if not filename or "." not in filename:
-        return None
-    ext = filename.rsplit(".", 1)[1].lower()
-    if ext in ("jpg", "jpeg", "png", "webp"):
-        return "jpg" if ext == "jpeg" else ext
-    return None
+    id: str = Field(..., description="ID медиа-объекта (UUID)")
+    bucket: str = Field(..., description="Имя bucket в хранилище")
+    object_key: str = Field(..., description="Ключ объекта в bucket")
+    url: AnyUrl = Field(..., description="Абсолютный URL доступа к медиа")
+    content_type: str | None = Field(None, description="MIME тип файла")
 
 
 @app.post("/v1/media/upload", response_model=UploadResp, operation_id="upload_media")
 async def upload_media(
+    request: Request,
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
     current: User = Depends(get_current_user),
 ):
+    t0 = time.perf_counter()
+
+    ext_from_name = guess_ext(file.filename)
+    if not ext_from_name:
+        raise HTTPException(status_code=400, detail="only jpg/jpeg/png/webp files are allowed")
+
     if not file.content_type or not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="only image/* is allowed")
 
-    bucket = _minio_bucket()
-
-    ext = guess_ext(file.filename) or "jpg"
-    object_key = f"{current.id}/{uuid.uuid4()}.{ext}"
-
     data = await file.read()
-    put_object(bucket=bucket, key=object_key, data=data, content_type=file.content_type)
+    if not data:
+        raise HTTPException(status_code=400, detail="empty file")
+
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail=f"file too large (max {MAX_UPLOAD_BYTES} bytes)")
+
+    sniff_mime, sniff_ext = sniff_image_mime(data)
+    if not sniff_mime or sniff_mime not in ALLOWED_IMAGE_MIME:
+        raise HTTPException(status_code=400, detail="invalid image mime by content")
+
+    pil_verify_image(data)
+
+    data2, final_mime, final_ext = maybe_convert_to_webp(data)
+    if final_mime not in ALLOWED_IMAGE_MIME:
+        raise HTTPException(status_code=400, detail="unsupported image after processing")
+
+    bucket = _minio_bucket()
+    object_key = f"{current.id}/{uuid.uuid4()}.{final_ext}"
+
+    checksum = hashlib.sha256(data2).hexdigest()
+    size_bytes = len(data2)
+
+    put_object_with_retry(object_key=object_key, data=data2, content_type=final_mime)
 
     media_id = str(uuid.uuid4())
-    m_kwargs = dict(
+    m_kwargs: dict[str, Any] = dict(
         id=media_id,
         owner_id=current.id,
         bucket=bucket,
         object_key=object_key,
-        content_type=file.content_type,
+        content_type=final_mime,
     )
+
     if hasattr(Media, "created_at"):
         m_kwargs["created_at"] = datetime.utcnow()
+    if hasattr(Media, "size_bytes"):
+        m_kwargs["size_bytes"] = size_bytes
+    if hasattr(Media, "checksum_sha256"):
+        m_kwargs["checksum_sha256"] = checksum
 
     db.add(Media(**m_kwargs))
     db.commit()
+
+    base = str(request.base_url).rstrip("/")
+    url = f"{base}/media/{bucket}/{object_key}"
+
+    logger.info(
+        "media_upload ok user=%s media_id=%s bytes=%s mime=%s ms=%s",
+        current.id,
+        media_id,
+        size_bytes,
+        final_mime,
+        int((time.perf_counter() - t0) * 1000),
+    )
 
     return UploadResp(
         id=media_id,
         bucket=bucket,
         object_key=object_key,
-        url=f"/media/{bucket}/{object_key}",
-        content_type=file.content_type,
+        url=url,
+        content_type=final_mime,
     )
 
 
 class CreateJobReq(BaseModel):
-    media_id: str
-    hint: dict[str, Any] | None = None
+    media_id: str = Field(..., description="ID загруженного медиа")
+    hint: dict[str, Any] | None = Field(
+        default=None,
+        description="Подсказки для AI (JSON). Структура зависит от версии модели.",
+        examples=[{"category_hint": "odezhda/futbolki"}],
+    )
 
 
 class CreateJobResp(BaseModel):
-    job_id: str
-    status: str
+    job_id: str = Field(..., description="ID задачи AI")
+    status: str = Field(..., description="Статус (queued/processing/done/error)")
 
 
 @app.post("/v1/ai/jobs", response_model=CreateJobResp, operation_id="create_ai_job")
@@ -253,7 +444,7 @@ def get_ai_job(
     )
 
 
-@app.get("/v1/categories/tree", operation_id="categories_tree")
+@app.get("/v1/categories/tree", operation_id="categories_tree", response_model=dict)
 def categories_tree(db: Session = Depends(get_db)):
     cats = db.query(Category).all()
     nodes = {
@@ -270,16 +461,16 @@ def categories_tree(db: Session = Depends(get_db)):
 
 
 class ProductCreate(BaseModel):
-    title: str | None = None
-    description: str | None = None
+    title: str | None = Field(None, max_length=200)
+    description: str | None = Field(None, max_length=10000)
     category_id: str | None = None
     attributes: dict[str, Any] | None = None
     tags: list[str] | None = None
 
 
 class ProductPatch(BaseModel):
-    title: str | None = None
-    description: str | None = None
+    title: str | None = Field(None, max_length=200)
+    description: str | None = Field(None, max_length=10000)
     category_id: str | None = None
     attributes: dict[str, Any] | None = None
     tags: list[str] | None = None
@@ -288,10 +479,10 @@ class ProductPatch(BaseModel):
 
 class AttachMediaReq(BaseModel):
     media_id: str
-    kind: str = "original"  # original|processed
+    kind: str = Field("original", description="original|processed")
 
 
-@app.post("/v1/products", operation_id="create_product")
+@app.post("/v1/products", operation_id="create_product", response_model=dict)
 def create_product(
     payload: ProductCreate,
     db: Session = Depends(get_db),
@@ -302,7 +493,7 @@ def create_product(
     title = (payload.title or "Новый товар").strip()
     description = (payload.description or "").strip()
 
-    p_kwargs = dict(
+    p_kwargs: dict[str, Any] = dict(
         id=str(uuid.uuid4()),
         owner_id=current.id,
         status="draft",
@@ -321,7 +512,6 @@ def create_product(
     db.add(p)
     db.commit()
 
-    # обновляем поисковый индекс гардероба
     try:
         enqueue_index_product(p.id)
     except Exception:
@@ -330,7 +520,7 @@ def create_product(
     return {"id": p.id, "status": p.status}
 
 
-@app.get("/v1/products", operation_id="list_products")
+@app.get("/v1/products", operation_id="list_products", response_model=dict)
 def list_products(
     db: Session = Depends(get_db),
     current: User = Depends(get_current_user),
@@ -368,7 +558,7 @@ def list_products(
     }
 
 
-@app.post("/v1/products/{product_id}/media", operation_id="attach_media")
+@app.post("/v1/products/{product_id}/media", operation_id="attach_media", response_model=dict)
 def attach_media_to_product(
     product_id: str,
     payload: AttachMediaReq,
@@ -399,7 +589,7 @@ def attach_media_to_product(
     if existing:
         return {"status": "ok", "id": existing.id}
 
-    pm_kwargs = dict(
+    pm_kwargs: dict[str, Any] = dict(
         id=str(uuid.uuid4()),
         product_id=p.id,
         bucket=m.bucket,
@@ -414,13 +604,11 @@ def attach_media_to_product(
     pm = ProductMedia(**pm_kwargs)
     db.add(pm)
 
-    # чтобы сортировка/поиск учитывали прикрепление медиа
     if hasattr(p, "updated_at"):
         p.updated_at = datetime.utcnow()
 
     db.commit()
 
-    # обновляем поисковый индекс гардероба
     try:
         enqueue_index_product(product_id)
     except Exception:
@@ -429,7 +617,7 @@ def attach_media_to_product(
     return {"status": "ok", "id": pm.id}
 
 
-@app.get("/v1/products/{product_id}", operation_id="get_product")
+@app.get("/v1/products/{product_id}", operation_id="get_product", response_model=dict)
 def get_product(
     product_id: str,
     db: Session = Depends(get_db),
@@ -458,7 +646,7 @@ def get_product(
     }
 
 
-@app.patch("/v1/products/{product_id}", operation_id="patch_product")
+@app.patch("/v1/products/{product_id}", operation_id="patch_product", response_model=dict)
 def patch_product(
     product_id: str,
     patch: ProductPatch,
@@ -487,7 +675,6 @@ def patch_product(
 
     db.commit()
 
-    # обновляем поисковый индекс гардероба
     try:
         enqueue_index_product(product_id)
     except Exception:
@@ -496,7 +683,7 @@ def patch_product(
     return {"status": "ok"}
 
 
-@app.post("/v1/products/{product_id}/publish", operation_id="publish_product")
+@app.post("/v1/products/{product_id}/publish", operation_id="publish_product", response_model=dict)
 def publish_product(
     product_id: str,
     db: Session = Depends(get_db),
@@ -511,7 +698,6 @@ def publish_product(
         p.updated_at = datetime.utcnow()
     db.commit()
 
-    # обновляем поисковый индекс гардероба
     try:
         enqueue_index_product(product_id)
     except Exception:
