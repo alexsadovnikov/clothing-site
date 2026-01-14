@@ -56,10 +56,15 @@ def verify_password(password: str, password_hash: str) -> bool:
 
 
 def create_access_token(*, sub: str) -> str:
+    """
+    IMPORTANT:
+    sub must be JSON-serializable.
+    In our DB user.id may be UUID (python uuid.UUID), so we always cast to str here.
+    """
     now = _now_utc()
     exp = now + timedelta(minutes=JWT_EXPIRES_MIN)
     payload = {
-        "sub": sub,
+        "sub": str(sub),  # <-- FIX: ensure UUID is serialized
         "iat": int(now.timestamp()),
         "exp": int(exp.timestamp()),
     }
@@ -86,6 +91,8 @@ def get_current_user(
 
     user_id = decode_token(creds.credentials)
 
+    # Обычно строка ок (и для UUID-колонки Postgres тоже часто кастится),
+    # поэтому оставляем сравнение со строкой.
     u = db.query(User).filter(User.id == user_id).first()
     if not u:
         raise HTTPException(status_code=401, detail="User not found")
@@ -106,11 +113,6 @@ class RegisterReq(BaseModel):
     password: str
 
 
-class AuthResp(BaseModel):
-    access_token: str
-    token_type: str = "bearer"
-
-
 class LoginReq(BaseModel):
     email: EmailStr
     password: str
@@ -120,6 +122,19 @@ class MeResp(BaseModel):
     id: str
     email: str
     created_at: Optional[str] = None
+
+
+class UserPublic(BaseModel):
+    id: str
+    email: str
+    created_at: Optional[str] = None
+
+
+class AuthResp(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    # (опционально) удобно вернуть пользователя при register/login
+    user: Optional[UserPublic] = None
 
 
 # ---------------- Routes ----------------
@@ -134,7 +149,7 @@ def register(payload: RegisterReq, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.email == email).first()
 
     # 1) Уже существует и активен
-    if user and user.deleted_at is None and user.is_active:
+    if user and getattr(user, "deleted_at", None) is None and getattr(user, "is_active", True):
         raise HTTPException(status_code=409, detail="Email already registered")
 
     # 2) Существует, но был soft-delete / выключен — восстановим
@@ -163,14 +178,15 @@ def register(payload: RegisterReq, db: Session = Depends(get_db)):
         db.refresh(user)
 
     token = create_access_token(sub=user.id)
+
     return AuthResp(
         access_token=token,
         token_type="bearer",
-        user={
-            "id": user.id,
-            "email": user.email,
-            "created_at": user.created_at.isoformat() if user.created_at else None,
-        },
+        user=UserPublic(
+            id=str(user.id),
+            email=user.email,
+            created_at=user.created_at.isoformat() if getattr(user, "created_at", None) else None,
+        ),
     )
 
 
@@ -188,13 +204,22 @@ def login(payload: LoginReq, db: Session = Depends(get_db)):
     if not verify_password(payload.password, u.password_hash):
         raise HTTPException(status_code=401, detail="Invalid email or password")
 
-    return AuthResp(access_token=create_access_token(sub=u.id))
+    # FIX: create_access_token сам приводит sub к str
+    return AuthResp(
+        access_token=create_access_token(sub=u.id),
+        token_type="bearer",
+        user=UserPublic(
+            id=str(u.id),
+            email=u.email,
+            created_at=u.created_at.isoformat() if getattr(u, "created_at", None) else None,
+        ),
+    )
 
 
 @router.get("/me", response_model=MeResp)
 def me(user: User = Depends(get_current_user)):
     return MeResp(
-        id=user.id,
+        id=str(user.id),
         email=user.email,
         created_at=user.created_at.isoformat() if getattr(user, "created_at", None) else None,
     )
@@ -205,6 +230,7 @@ def delete_me(db: Session = Depends(get_db), user: User = Depends(get_current_us
     # soft delete
     user.is_active = False
     user.deleted_at = datetime.utcnow()
-    user.updated_at = datetime.utcnow()
+    if hasattr(user, "updated_at"):
+        user.updated_at = datetime.utcnow()
     db.commit()
     return {"status": "ok"}
