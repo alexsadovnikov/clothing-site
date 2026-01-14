@@ -1,9 +1,34 @@
+# env / secrets
 .env
+.env.*
+!.env.example
+.env.redacted
+.env.bak*
+
+# logs / caches
 *.log
 __pycache__/
 *.pyc
+.pytest_cache/
+
+# OS / editors
 .DS_Store
+
+# node
 node_modules/
-.env
-.env.bak*
-compose.yaml.bak*
+
+# local helper script
+dc
+
+# dumps / backups / archives
+_db_backup/
+*.sql
+*.tar.gz
+
+# optional compose variants + monitoring stuff (если это локальные файлы сервера)
+compose.monitoring.yaml
+compose.test.yaml
+monitoring/
+
+# generated web static (если это билд-артефакты; если это исходники — убери строку)
+apps/web/public/
