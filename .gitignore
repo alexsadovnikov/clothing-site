@@ -32,3 +32,17 @@ monitoring/
 
 # generated web static (если это билд-артефакты; если это исходники — убери строку)
 apps/web/public/
+
+# Local virtualenv / python
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Local backups
+compose.yaml.bak.*
+*.bak
+
+# Local artifacts (do not commit)
+requirements/
+tests/
