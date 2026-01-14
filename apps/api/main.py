@@ -435,12 +435,14 @@ def get_ai_job(
     if not job or job.owner_id != current.id:
         raise HTTPException(status_code=404, detail="job not found")
 
+    # ВАЖНО: SQLAlchemy может вернуть UUID объект, а Pydantic ждёт str.
+    # Поэтому приводим UUID -> str, чтобы не ловить 500 на валидации ответа.
     return JobResp(
-        job_id=job.id,
+        job_id=str(job.id),
         status=job.status,
         result=job.result_json,
         error=job.error,
-        draft_product_id=job.draft_product_id,
+        draft_product_id=str(job.draft_product_id) if job.draft_product_id else None
     )
 
 
