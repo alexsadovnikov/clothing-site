@@ -207,8 +207,10 @@ PY
   # 3) create ai job
   http POST "$BASE_URL/v1/ai/jobs" "{\"media_id\":\"$MEDIA_ID\",\"hint\":{}}" "$TOKEN"
   expect_2xx
-  JOB_ID="$(json_field id)"
-  [[ -n "$JOB_ID" ]] || fail_dump "ai_job_create: id empty"
+  # API может возвращать job_id (новый контракт) или id (старый) — поддержим оба
+  JOB_ID="$(json_field job_id)"
+  [[ -n "$JOB_ID" ]] || JOB_ID="$(json_field id)"
+  [[ -n "$JOB_ID" ]] || fail_dump "ai_job_create: id/job_id empty"
   say "[OK] ai_job_create id=$JOB_ID"
 
   # 4) poll status
