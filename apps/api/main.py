@@ -1,3 +1,4 @@
+from starlette.middleware.proxy_headers import ProxyHeadersMiddleware
 import os
 import uuid
 import time
@@ -62,6 +63,8 @@ def _minio_bucket() -> str:
 
 
 app = FastAPI(title="Clothing API", version="0.1.0")
+
+app.add_middleware(ProxyHeadersMiddleware, trusted_hosts='*')
 
 app.add_middleware(CORSMiddleware, **_cors_kwargs())
 
@@ -348,7 +351,17 @@ async def upload_media(
     db.add(Media(**m_kwargs))
     db.commit()
 
-    base = str(request.base_url).rstrip("/")
+    # Формируем абсолютный URL правильно за reverse-proxy (nginx):
+    # 1) Если задан PUBLIC_BASE_URL — используем его (самый надёжный способ)
+    # 2) Иначе собираем из forwarded-заголовков
+    public_base = (os.getenv("PUBLIC_BASE_URL") or "").strip().rstrip("/")
+    if public_base:
+        base = public_base
+    else:
+        proto = (request.headers.get("x-forwarded-proto") or request.url.scheme or "http").split(",")[0].strip()
+        host = (request.headers.get("x-forwarded-host") or request.headers.get("host") or "").split(",")[0].strip()
+        base = f"{proto}://{host}".rstrip("/")
+
     url = f"{base}/media/{bucket}/{object_key}"
 
     logger.info(

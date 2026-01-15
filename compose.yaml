@@ -50,37 +50,6 @@ services:
       - "127.0.0.1:7700:7700"
     restart: unless-stopped
 
-  web:
-    build: ./apps/web
-    container_name: clothing-web
-    environment:
-      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL}
-      API_INTERNAL_URL: http://api:8001
-      AI_INTERNAL_URL: http://ai:8002
-
-      JWT_SECRET: ${JWT_SECRET}
-      JWT_ALG: ${JWT_ALG}
-      JWT_EXPIRES_MIN: ${JWT_EXPIRES_MIN}
-
-      DATABASE_URL: ${DATABASE_URL}
-      REDIS_URL: ${REDIS_URL}
-
-      MINIO_ENDPOINT: minio:9000
-      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
-      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
-      MINIO_BUCKET: ${MINIO_BUCKET}
-      MINIO_SECURE: ${MINIO_SECURE}
-
-      MEILI_HOST: ${MEILI_HOST}
-      MEILI_MASTER_KEY: ${MEILI_MASTER_KEY}
-      MEILI_INDEX: ${MEILI_INDEX}
-    ports:
-      - "127.0.0.1:3001:3000"
-    depends_on:
-      - api
-      - ai
-    restart: unless-stopped
-
   api:
     build: ./apps/api
     container_name: clothing-api
@@ -108,6 +77,7 @@ services:
 
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL}
       PYTHONUNBUFFERED: ${PYTHONUNBUFFERED}
+    command: ["uvicorn","main:app","--host","0.0.0.0","--port","8001","--proxy-headers","--forwarded-allow-ips","*"]
     ports:
       - "127.0.0.1:8001:8001"
     depends_on:
@@ -139,10 +109,42 @@ services:
       AI_INTERNAL_URL: http://ai:8002
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL}
       PYTHONUNBUFFERED: ${PYTHONUNBUFFERED}
+    command: ["uvicorn","main:app","--host","0.0.0.0","--port","8002","--proxy-headers","--forwarded-allow-ips","*"]
     ports:
       - "127.0.0.1:8002:8002"
     depends_on:
       - redis
+    restart: unless-stopped
+
+  web:
+    build: ./apps/web
+    container_name: clothing-web
+    environment:
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL}
+      API_INTERNAL_URL: http://api:8001
+      AI_INTERNAL_URL: http://ai:8002
+
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_ALG: ${JWT_ALG}
+      JWT_EXPIRES_MIN: ${JWT_EXPIRES_MIN}
+
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
+      MINIO_BUCKET: ${MINIO_BUCKET}
+      MINIO_SECURE: ${MINIO_SECURE}
+
+      MEILI_HOST: ${MEILI_HOST}
+      MEILI_MASTER_KEY: ${MEILI_MASTER_KEY}
+      MEILI_INDEX: ${MEILI_INDEX}
+    ports:
+      - "127.0.0.1:3001:3000"
+    depends_on:
+      - api
+      - ai
     restart: unless-stopped
 
   worker:
