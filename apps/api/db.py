@@ -1,10 +1,13 @@
+# db.py
 import os
 from typing import Generator
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
-# Берём из .env (через docker compose env_file), чистим пробелы
+from models import Base  # ✅ безопасно: Base живёт в models
+
+
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is not set (check .env and docker compose env_file)")
@@ -21,10 +24,6 @@ SessionLocal = sessionmaker(
     autocommit=False,
     future=True,
 )
-
-# Важно: импорт после engine/sessionmaker (во избежание циклических импортов)
-import models  # noqa: E402,F401  (важно: загружаем модели)
-from models import Base  # noqa: E402
 
 
 def init_db() -> None:

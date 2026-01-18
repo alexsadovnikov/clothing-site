@@ -1,6 +1,7 @@
 import uuid
 from datetime import datetime
-from typing import Any
+from typing import Optional
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
@@ -12,6 +13,10 @@ from models import User, Look, LookItem, Product, ProductMedia
 
 router = APIRouter(prefix="/v1", tags=["looks"])
 
+
+# ============================================================
+# SCHEMAS
+# ============================================================
 
 class LookCreate(BaseModel):
     title: str | None = None
@@ -26,12 +31,16 @@ class LookPatch(BaseModel):
 
 
 class AddLookItemReq(BaseModel):
-    product_id: str
+    product_id_uuid: UUID
 
 
 def _now() -> datetime:
     return datetime.utcnow()
 
+
+# ============================================================
+# LOOKS
+# ============================================================
 
 @router.post("/looks", operation_id="create_look")
 def create_look(
@@ -40,17 +49,20 @@ def create_look(
     current: User = Depends(get_current_user),
 ):
     now = _now()
+
     lk = Look(
         id=str(uuid.uuid4()),
         owner_id=current.id,
         title=(payload.title or "").strip() or None,
         occasion=(payload.occasion or "").strip() or None,
         season=(payload.season or "").strip() or None,
-        created_at=now if hasattr(Look, "created_at") else None,
-        updated_at=now if hasattr(Look, "updated_at") else None,
+        created_at=now,
+        updated_at=now,
     )
+
     db.add(lk)
     db.commit()
+
     return {"id": lk.id}
 
 
@@ -64,10 +76,11 @@ def list_looks(
     q = db.query(Look).filter(Look.owner_id == current.id)
 
     total = q.count()
-    if hasattr(Look, "updated_at"):
-        q = q.order_by(Look.updated_at.desc().nullslast(), Look.created_at.desc().nullslast())
-    else:
-        q = q.order_by(Look.created_at.desc().nullslast())
+
+    q = q.order_by(
+        Look.updated_at.desc().nullslast(),
+        Look.created_at.desc().nullslast(),
+    )
 
     looks = q.limit(limit).offset(offset).all()
 
@@ -78,8 +91,8 @@ def list_looks(
                 "title": l.title,
                 "occasion": l.occasion,
                 "season": l.season,
-                "created_at": l.created_at.isoformat() if getattr(l, "created_at", None) else None,
-                "updated_at": l.updated_at.isoformat() if getattr(l, "updated_at", None) else None,
+                "created_at": l.created_at.isoformat(),
+                "updated_at": l.updated_at.isoformat(),
             }
             for l in looks
         ],
@@ -95,46 +108,67 @@ def get_look(
     db: Session = Depends(get_db),
     current: User = Depends(get_current_user),
 ):
-    lk = db.query(Look).filter(Look.id == look_id).first()
-    if not lk or lk.owner_id != current.id:
+    lk = (
+        db.query(Look)
+        .filter(Look.id == look_id, Look.owner_id == current.id)
+        .first()
+    )
+    if not lk:
         raise HTTPException(status_code=404, detail="look not found")
 
-    link_rows = db.query(LookItem).filter(LookItem.look_id == lk.id).all()
-    product_ids = [x.product_id for x in link_rows]
+    link_rows = (
+        db.query(LookItem)
+        .filter(LookItem.look_id == lk.id)
+        .all()
+    )
+
+    product_uuids = [li.product_id_uuid for li in link_rows]
 
     products: list[Product] = []
-    media_by_product: dict[str, list[ProductMedia]] = {}
+    media_by_product: dict[UUID, list[ProductMedia]] = {}
 
-    if product_ids:
+    if product_uuids:
         products = (
             db.query(Product)
-            .filter(Product.id.in_(product_ids))
-            .filter(Product.owner_id == current.id)
+            .filter(
+                Product.id_uuid.in_(product_uuids),
+                Product.owner_id == current.id,
+            )
             .all()
         )
-        medias = db.query(ProductMedia).filter(ProductMedia.product_id.in_(product_ids)).all()
-        for m in medias:
-            media_by_product.setdefault(m.product_id, []).append(m)
 
-    prod_map = {p.id: p for p in products}
+        medias = (
+            db.query(ProductMedia)
+            .filter(ProductMedia.product_id_uuid.in_(product_uuids))
+            .all()
+        )
+
+        for m in medias:
+            media_by_product.setdefault(m.product_id_uuid, []).append(m)
+
+    prod_map = {p.id_uuid: p for p in products}
 
     items = []
-    for pid in product_ids:
+    for pid in product_uuids:
         p = prod_map.get(pid)
         if not p:
-            # если вещь удалена/не принадлежит — просто пропускаем
             continue
+
         items.append(
             {
-                "id": p.id,
+                "product_id_uuid": str(p.id_uuid),
                 "status": p.status,
                 "title": p.title,
                 "category_id": p.category_id,
                 "tags": p.tags or [],
-                "updated_at": p.updated_at.isoformat() if getattr(p, "updated_at", None) else None,
+                "updated_at": p.updated_at.isoformat(),
                 "media": [
-                    {"id": m.id, "kind": m.kind, "url": f"/media/{m.bucket}/{m.object_key}"}
-                    for m in (media_by_product.get(p.id) or [])
+                    {
+                        "id": m.id,
+                        "kind": m.kind,
+                        "url": f"/media/{m.bucket}/{m.object_key}",
+                    }
+                    for m in media_by_product.get(p.id_uuid, [])
                 ],
             }
         )
@@ -144,8 +178,8 @@ def get_look(
         "title": lk.title,
         "occasion": lk.occasion,
         "season": lk.season,
-        "created_at": lk.created_at.isoformat() if getattr(lk, "created_at", None) else None,
-        "updated_at": lk.updated_at.isoformat() if getattr(lk, "updated_at", None) else None,
+        "created_at": lk.created_at.isoformat(),
+        "updated_at": lk.updated_at.isoformat(),
         "items": items,
     }
 
@@ -157,8 +191,12 @@ def patch_look(
     db: Session = Depends(get_db),
     current: User = Depends(get_current_user),
 ):
-    lk = db.query(Look).filter(Look.id == look_id).first()
-    if not lk or lk.owner_id != current.id:
+    lk = (
+        db.query(Look)
+        .filter(Look.id == look_id, Look.owner_id == current.id)
+        .first()
+    )
+    if not lk:
         raise HTTPException(status_code=404, detail="look not found")
 
     if payload.title is not None:
@@ -168,8 +206,7 @@ def patch_look(
     if payload.season is not None:
         lk.season = payload.season.strip() or None
 
-    if hasattr(lk, "updated_at"):
-        lk.updated_at = _now()
+    lk.updated_at = _now()
 
     db.commit()
     return {"status": "ok"}
@@ -181,15 +218,26 @@ def delete_look(
     db: Session = Depends(get_db),
     current: User = Depends(get_current_user),
 ):
-    lk = db.query(Look).filter(Look.id == look_id).first()
-    if not lk or lk.owner_id != current.id:
+    lk = (
+        db.query(Look)
+        .filter(Look.id == look_id, Look.owner_id == current.id)
+        .first()
+    )
+    if not lk:
         raise HTTPException(status_code=404, detail="look not found")
 
-    db.query(LookItem).filter(LookItem.look_id == lk.id).delete(synchronize_session=False)
+    db.query(LookItem).filter(LookItem.look_id == lk.id).delete(
+        synchronize_session=False
+    )
+
     db.delete(lk)
     db.commit()
     return {"status": "ok"}
 
+
+# ============================================================
+# LOOK ITEMS
+# ============================================================
 
 @router.post("/looks/{look_id}/items", operation_id="add_look_item")
 def add_look_item(
@@ -198,17 +246,31 @@ def add_look_item(
     db: Session = Depends(get_db),
     current: User = Depends(get_current_user),
 ):
-    lk = db.query(Look).filter(Look.id == look_id).first()
-    if not lk or lk.owner_id != current.id:
+    lk = (
+        db.query(Look)
+        .filter(Look.id == look_id, Look.owner_id == current.id)
+        .first()
+    )
+    if not lk:
         raise HTTPException(status_code=404, detail="look not found")
 
-    p = db.query(Product).filter(Product.id == payload.product_id).first()
-    if not p or p.owner_id != current.id:
+    product = (
+        db.query(Product)
+        .filter(
+            Product.id_uuid == payload.product_id_uuid,
+            Product.owner_id == current.id,
+        )
+        .first()
+    )
+    if not product:
         raise HTTPException(status_code=404, detail="product not found")
 
     existing = (
         db.query(LookItem)
-        .filter(LookItem.look_id == lk.id, LookItem.product_id == p.id)
+        .filter(
+            LookItem.look_id == lk.id,
+            LookItem.product_id_uuid == product.id_uuid,
+        )
         .first()
     )
     if existing:
@@ -217,36 +279,45 @@ def add_look_item(
     li = LookItem(
         id=str(uuid.uuid4()),
         look_id=lk.id,
-        product_id=p.id,
-        created_at=_now() if hasattr(LookItem, "created_at") else None,
+        product_id_uuid=product.id_uuid,
+        created_at=_now(),
     )
-    db.add(li)
 
-    if hasattr(lk, "updated_at"):
-        lk.updated_at = _now()
+    db.add(li)
+    lk.updated_at = _now()
 
     db.commit()
     return {"status": "ok", "id": li.id}
 
 
-@router.delete("/looks/{look_id}/items/{product_id}", operation_id="remove_look_item")
+@router.delete(
+    "/looks/{look_id}/items/{product_id_uuid}",
+    operation_id="remove_look_item",
+)
 def remove_look_item(
     look_id: str,
-    product_id: str,
+    product_id_uuid: UUID,
     db: Session = Depends(get_db),
     current: User = Depends(get_current_user),
 ):
-    lk = db.query(Look).filter(Look.id == look_id).first()
-    if not lk or lk.owner_id != current.id:
+    lk = (
+        db.query(Look)
+        .filter(Look.id == look_id, Look.owner_id == current.id)
+        .first()
+    )
+    if not lk:
         raise HTTPException(status_code=404, detail="look not found")
 
     deleted = (
         db.query(LookItem)
-        .filter(LookItem.look_id == lk.id, LookItem.product_id == product_id)
+        .filter(
+            LookItem.look_id == lk.id,
+            LookItem.product_id_uuid == product_id_uuid,
+        )
         .delete(synchronize_session=False)
     )
 
-    if deleted and hasattr(lk, "updated_at"):
+    if deleted:
         lk.updated_at = _now()
 
     db.commit()

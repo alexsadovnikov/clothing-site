@@ -1,22 +1,30 @@
-fastapi==0.115.6
-uvicorn[standard]==0.32.1
+# --- Web / ASGI ---
+fastapi~=0.110.3
+starlette~=0.37.2
+uvicorn[standard]~=0.27.1
 
-SQLAlchemy==2.0.36
-alembic==1.13.3
-psycopg2-binary==2.9.9
+# --- DB ---
+SQLAlchemy~=2.0.36
+alembic~=1.13.3
+psycopg2-binary~=2.9.9
 
-redis==5.2.0
-rq==1.16.2
+# --- Cache / Queue ---
+redis~=5.2.0
+rq~=1.16.2
 
-minio==7.2.15
-meilisearch==0.31.5
+# --- Storage / Search ---
+minio~=7.2.15
+meilisearch~=0.31.5
 
-pydantic-settings==2.6.1
-python-multipart==0.0.12
-requests==2.32.3
+# --- Config / Parsing ---
+pydantic~=2.6.4
+pydantic-settings~=2.2.1
+python-multipart~=0.0.21
+python-dotenv~=1.0.1
+requests~=2.32.3
 
-passlib[bcrypt]==1.7.4
-bcrypt==4.0.1
-python-jose[cryptography]==3.3.0
-email-validator==2.2.0
-python-dotenv==1.0.1
+# --- Auth / Security ---
+passlib[bcrypt]~=1.7.4
+bcrypt~=4.0.1
+python-jose[cryptography]~=3.3.0
+email-validator~=2.2.0
