@@ -18,10 +18,6 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import declarative_base, relationship
 
-# ============================================================
-# BASE
-# ============================================================
-
 Base = declarative_base()
 
 # ============================================================
@@ -36,9 +32,6 @@ class AIJobState(str, enum.Enum):
 
 
 class ProductState(str, enum.Enum):
-    """
-    Состояние карточки продукта.
-    """
     DRAFT_EMPTY = "DRAFT_EMPTY"
     DRAFT_READY = "DRAFT_READY"
     READY = "READY"
@@ -47,9 +40,7 @@ class ProductState(str, enum.Enum):
 
 
 # ============================================================
-# ASSOCIATION TABLE
-# products <-> media
-# M:N через UUID (АКТУАЛЬНАЯ СХЕМА)
+# ASSOCIATION TABLE (products <-> media) — UUID ONLY
 # ============================================================
 
 product_media = Table(
@@ -77,7 +68,6 @@ class User(Base):
     __tablename__ = "users"
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-
     email = Column(String, unique=True, nullable=False)
     password_hash = Column(String, nullable=False)
 
@@ -101,19 +91,16 @@ class Category(Base):
 
 
 # ============================================================
-# PRODUCT
-# PRIMARY KEY = id_uuid
-# legacy id — временно (PHASE 5 → удалить)
+# PRODUCT — PK = id_uuid (LEGACY id сохранён)
 # ============================================================
 
 class Product(Base):
     __tablename__ = "products"
 
-    # 🔥 ЕДИНСТВЕННЫЙ АКТУАЛЬНЫЙ PRIMARY KEY
+    # 🔥 ЕДИНСТВЕННЫЙ PRIMARY KEY
     id_uuid = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
 
-    # ⚠️ legacy string id (старые данные / обратная совместимость)
-    # PHASE 5: колонка будет удалена
+    # ⚠️ legacy id (НЕ PK, будет удалён в Phase 5)
     id = Column(String, nullable=False, unique=True, index=True)
 
     owner_id = Column(
@@ -124,7 +111,7 @@ class Product(Base):
     )
 
     status = Column(
-        String,  # Enum переведём позже, когда уберём legacy
+        String,
         nullable=False,
         default=ProductState.DRAFT_EMPTY.value,
         index=True,
@@ -146,7 +133,6 @@ class Product(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow)
 
-    # 🔥 M:N MEDIA через UUID
     media = relationship(
         "Media",
         secondary=product_media,
@@ -211,7 +197,6 @@ class AIJob(Base):
         index=True,
     )
 
-    # 🔥 UUID-ссылка на продукт (draft / результат AI)
     draft_product_id_uuid = Column(
         UUID(as_uuid=True),
         ForeignKey("products.id_uuid", ondelete="SET NULL"),
