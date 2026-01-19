@@ -13,10 +13,10 @@ from sqlalchemy import (
     JSON,
     Boolean,
     BigInteger,
-    Table,
 )
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import declarative_base, relationship
+from sqlalchemy.sql import func
 
 Base = declarative_base()
 
@@ -40,27 +40,6 @@ class ProductState(str, enum.Enum):
 
 
 # ============================================================
-# ASSOCIATION TABLE (products <-> media) — UUID ONLY
-# ============================================================
-
-product_media = Table(
-    "product_media",
-    Base.metadata,
-    Column(
-        "product_id_uuid",
-        UUID(as_uuid=True),
-        ForeignKey("products.id_uuid", ondelete="CASCADE"),
-        primary_key=True,
-    ),
-    Column(
-        "media_id",
-        String,
-        ForeignKey("media.id", ondelete="CASCADE"),
-        primary_key=True,
-    ),
-)
-
-# ============================================================
 # USER
 # ============================================================
 
@@ -74,8 +53,8 @@ class User(Base):
     is_active = Column(Boolean, default=True, nullable=False)
     deleted_at = Column(DateTime)
 
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
 
 
 # ============================================================
@@ -86,21 +65,20 @@ class Category(Base):
     __tablename__ = "categories"
 
     id = Column(String, primary_key=True)
-    path = Column(String, nullable=False)
+    path = Column(String, nullable=False, index=True)
     title = Column(String, nullable=False)
 
 
 # ============================================================
-# PRODUCT — PK = id_uuid (LEGACY id сохранён)
+# PRODUCT
 # ============================================================
 
 class Product(Base):
     __tablename__ = "products"
 
-    # 🔥 ЕДИНСТВЕННЫЙ PRIMARY KEY
     id_uuid = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
 
-    # ⚠️ legacy id (НЕ PK, будет удалён в Phase 5)
+    # legacy id (будет удалён позже)
     id = Column(String, nullable=False, unique=True, index=True)
 
     owner_id = Column(
@@ -111,9 +89,9 @@ class Product(Base):
     )
 
     status = Column(
-        String,
+        Enum(ProductState, name="product_state"),
         nullable=False,
-        default=ProductState.DRAFT_EMPTY.value,
+        default=ProductState.DRAFT_EMPTY,
         index=True,
     )
 
@@ -130,19 +108,48 @@ class Product(Base):
     attributes = Column(JSON)
     tags = Column(JSON)
 
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
 
-    media = relationship(
-        "Media",
-        secondary=product_media,
-        back_populates="products",
+    # ВАЖНО: product_media — это НЕ many-to-many
+    media_items = relationship(
+        "ProductMedia",
+        back_populates="product",
+        cascade="all, delete-orphan",
         lazy="selectin",
     )
 
 
 # ============================================================
-# MEDIA
+# PRODUCT MEDIA (РЕАЛЬНАЯ ТАБЛИЦА, НЕ ASSOCIATION)
+# ============================================================
+
+class ProductMedia(Base):
+    __tablename__ = "product_media"
+
+    id = Column(String, primary_key=True)
+
+    product_id_uuid = Column(
+        UUID(as_uuid=True),
+        ForeignKey("products.id_uuid", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    product_id = Column(String, nullable=False)
+
+    bucket = Column(String, nullable=False)
+    object_key = Column(String, nullable=False)
+    kind = Column(String, nullable=False)
+    content_type = Column(String)
+
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+
+    product = relationship("Product", back_populates="media_items")
+
+
+# ============================================================
+# MEDIA (как физический объект, используется AIJob)
 # ============================================================
 
 class Media(Base):
@@ -164,14 +171,7 @@ class Media(Base):
     size_bytes = Column(BigInteger)
     checksum_sha256 = Column(String(64))
 
-    created_at = Column(DateTime, default=datetime.utcnow)
-
-    products = relationship(
-        "Product",
-        secondary=product_media,
-        back_populates="media",
-        lazy="selectin",
-    )
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
 
 
 # ============================================================
@@ -213,5 +213,45 @@ class AIJob(Base):
 
     hint = Column(JSON, default=dict)
 
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+
+# ============================================================
+# OUTBOX EVENTS
+# ============================================================
+
+class OutboxEvent(Base):
+    __tablename__ = "outbox_events"
+
+    id = Column(BigInteger, primary_key=True)
+
+    event_type = Column(String, nullable=False, index=True)
+    aggregate_type = Column(String, nullable=False)
+    aggregate_id = Column(UUID(as_uuid=True), nullable=False, index=True)
+
+    payload = Column(JSON, nullable=False)
+
+    occurred_at = Column(DateTime, server_default=func.now(), nullable=False)
+    processed_at = Column(DateTime, nullable=True)
+
+
+# ============================================================
+# STATE HISTORY (AUDIT LOG)
+# ============================================================
+
+class StateHistory(Base):
+    __tablename__ = "state_history"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+
+    entity_type = Column(String, nullable=False, index=True)
+    entity_id = Column(UUID(as_uuid=True), nullable=False, index=True)
+
+    from_state = Column(String, nullable=True)
+    to_state = Column(String, nullable=True)
+
+    event = Column(String, nullable=False)
+    actor = Column(String, nullable=True)
+
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)

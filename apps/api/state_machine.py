@@ -1,63 +1,78 @@
-from typing import Dict, Set
+from typing import Dict
 
-from models import ProductState
+from sqlalchemy.orm import Session
+
+from models import Product, ProductState
+from outbox import emit_event
+from events.product import product_published_v1
 
 
 class InvalidStateTransition(Exception):
-    """
-    Бросается, если система пытается сделать запрещённый переход.
-    Это НЕ 500, это бизнес-ошибка.
-    """
+    """Бизнес-ошибка перехода состояния (4xx)."""
     pass
 
 
 # ============================================================
-# PRODUCT STATE MACHINE
+# PRODUCT FSM — строго под models.ProductState
 # ============================================================
 
 PRODUCT_STATE_TRANSITIONS: Dict[ProductState, Dict[str, ProductState]] = {
-    ProductState.DRAFT: {
-        "upload_media": ProductState.UPLOADING_MEDIA,
+    ProductState.DRAFT_EMPTY: {
+        "prepare": ProductState.DRAFT_READY,
     },
-
-    ProductState.UPLOADING_MEDIA: {
-        "media_uploaded": ProductState.MEDIA_READY,
-        "media_failed": ProductState.DRAFT,
+    ProductState.DRAFT_READY: {
+        "ready": ProductState.READY,
     },
-
-    ProductState.MEDIA_READY: {
-        "start_ai": ProductState.AI_PENDING,
-        "reset": ProductState.DRAFT,
-    },
-
-    ProductState.AI_PENDING: {
-        "ai_started": ProductState.AI_PROCESSING,
-        "ai_failed": ProductState.AI_FAILED,
-    },
-
-    ProductState.AI_PROCESSING: {
-        "ai_completed": ProductState.AI_READY,
-        "ai_failed": ProductState.AI_FAILED,
-    },
-
-    ProductState.AI_FAILED: {
-        "retry_ai": ProductState.AI_PENDING,
-        "reset": ProductState.DRAFT,
-    },
-
-    ProductState.AI_READY: {
-        "confirm_data": ProductState.READY_FOR_PUBLISH,
-        "reset": ProductState.DRAFT,
-    },
-
-    ProductState.READY_FOR_PUBLISH: {
+    ProductState.READY: {
         "publish": ProductState.PUBLISHED,
-        "reset": ProductState.DRAFT,
     },
-
     ProductState.PUBLISHED: {
         "archive": ProductState.ARCHIVED,
     },
-
     ProductState.ARCHIVED: {},
 }
+
+
+# ============================================================
+# APPLY TRANSITION
+# ============================================================
+
+def apply_product_transition(
+    *,
+    session: Session,
+    product: Product,
+    transition: str,
+    actor: str | None = None,
+) -> ProductState:
+    """
+    Меняет состояние продукта и кладёт domain-event в outbox.
+
+    ❌ не делает commit
+    ❌ не пишет историю
+    """
+
+    current_state = product.status
+
+    allowed = PRODUCT_STATE_TRANSITIONS.get(current_state, {})
+    if transition not in allowed:
+        raise InvalidStateTransition(
+            f"Transition '{transition}' not allowed from state '{current_state.value}'"
+        )
+
+    next_state = allowed[transition]
+
+    # 1️⃣ Обновляем агрегат
+    product.status = next_state
+
+    # 2️⃣ Domain event — только publish
+    if transition == "publish":
+        emit_event(
+            session=session,
+            event=product_published_v1(
+                product_id=product.id_uuid,
+                owner_id=product.owner_id,
+                category_id=product.category_id,
+            ),
+        )
+
+    return next_state
