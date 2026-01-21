@@ -5,8 +5,8 @@ from uuid import UUID
 from fastapi import APIRouter, Query, HTTPException, Depends
 from meilisearch import Client as MeiliClient, errors as meili_errors
 
-from auth import get_current_user
-from models import User
+from apps.api.auth import get_current_user
+from apps.api.models import User
 
 router = APIRouter(prefix="/v1", tags=["catalog"])
 

@@ -28,7 +28,7 @@ config.set_main_option("sqlalchemy.url", db_url.replace("%", "%%"))
 # ---- metadata ----
 # поправь импорт под твой проект, если у тебя Base лежит иначе
 try:
-    from models import Base  # type: ignore
+    from apps.api.models import Base  # type: ignore
     target_metadata = Base.metadata
 except Exception:
     target_metadata = None

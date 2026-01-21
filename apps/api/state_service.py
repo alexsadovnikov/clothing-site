@@ -4,17 +4,15 @@ import uuid
 from typing import Literal
 
 from sqlalchemy.orm import Session
-
-from models import Product, StateHistory
-from state_machine import apply_product_transition
+from apps.api.models import Product, StateHistory
+from apps.api.state_machine import apply_product_transition
+from apps.api.outbox import add_outbox_event
+from apps.api.events.base import BaseEvent
 
 EntityType = Literal["product"]
 
 
 class StateTransitionError(Exception):
-    """
-    Бизнес-ошибка перехода состояния (4xx).
-    """
     pass
 
 
@@ -26,44 +24,34 @@ def change_state(
     event: str,
     actor_id: str | None = None,
 ):
-    """
-    Универсальный сервис смены состояния.
-
-    Для product:
-    - вызывает FSM (state_machine)
-    - пишет audit history
-
-    ❌ НЕ коммитит
-    ❌ НЕ эмитит события напрямую (это делает FSM)
-    """
-
     if entity_type != "product":
         raise StateTransitionError("Only product supported")
 
     if not isinstance(entity, Product):
         raise StateTransitionError("Entity is not Product")
 
-    current_state = entity.status
+    prev_state = entity.status
 
-    # 1️⃣ FSM + domain events
-    apply_product_transition(
+    domain_event: BaseEvent | None = apply_product_transition(
         session=db,
         product=entity,
         transition=event,
         actor=actor_id or "system",
     )
 
-    # 2️⃣ Audit log
-    history = StateHistory(
-        id=uuid.uuid4(),
-        entity_type="product",
-        entity_id=entity.id_uuid,
-        from_state=current_state.value if current_state else None,
-        to_state=entity.status,
-        event=event,
-        actor=str(actor_id) if actor_id else None,
-    )
+    if domain_event:
+        add_outbox_event(db, domain_event)
 
-    db.add(history)
+    db.add(
+        StateHistory(
+            id=uuid.uuid4(),
+            entity_type="product",
+            entity_id=entity.id_uuid,
+            from_state=prev_state.value if prev_state else None,
+            to_state=entity.status.value,
+            event=event,
+            actor=actor_id,
+        )
+    )
 
     return entity.status

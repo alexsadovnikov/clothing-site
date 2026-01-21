@@ -10,13 +10,13 @@ from passlib.context import CryptContext
 from pydantic import BaseModel, EmailStr
 from sqlalchemy.orm import Session
 
-from models import User
+from apps.api.models import User
 
 # DB dependency
 try:
-    from db import get_db  # type: ignore
+    from apps.api.db import get_db  # type: ignore
 except Exception:
-    from db import SessionLocal  # type: ignore
+    from apps.api.db import SessionLocal  # type: ignore
 
     def get_db() -> Generator[Session, None, None]:
         db = SessionLocal()

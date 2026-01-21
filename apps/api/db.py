@@ -5,7 +5,7 @@ from typing import Generator
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
-from models import Base  # ✅ безопасно: Base живёт в models
+from apps.api.models import Base  # ✅ безопасно: Base живёт в models
 
 
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()

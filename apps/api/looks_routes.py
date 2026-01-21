@@ -7,9 +7,9 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from db import get_db
-from auth import get_current_user
-from models import User, Look, LookItem, Product, ProductMedia
+from apps.api.db import get_db
+from apps.api.auth import get_current_user
+from apps.api.models import User, Look, LookItem, Product, ProductMedia
 
 router = APIRouter(prefix="/v1", tags=["looks"])
 

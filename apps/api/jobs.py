@@ -10,8 +10,8 @@ from uuid import UUID
 import requests
 from meilisearch import Client as MeiliClient
 
-from db import SessionLocal
-from models import (
+from apps.api.db import SessionLocal
+from apps.api.models import (
     AIJob,
     Media,
     Product,

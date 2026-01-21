@@ -1,34 +1,18 @@
-from __future__ import annotations
-
-from datetime import datetime
-from typing import Any, Dict
-
+import uuid
 from sqlalchemy.orm import Session
 
-from models import OutboxEvent
+from apps.api.models import OutboxEvent
+from apps.api.events.base import BaseEvent
 
 
-def emit_event(
-    *,
-    session: Session,
-    event_type: str,
-    aggregate_type: str,
-    aggregate_id,
-    payload: Dict[str, Any],
-) -> OutboxEvent:
-    """
-    Записывает domain event в outbox.
-
-    ⚠️ ДОЛЖЕН вызываться внутри активной транзакции.
-    ⚠️ commit() здесь НЕ делаем.
-    """
-    event = OutboxEvent(
-        event_type=event_type,
-        aggregate_type=aggregate_type,
-        aggregate_id=aggregate_id,
-        payload=payload,
-        occurred_at=datetime.utcnow(),
+def add_outbox_event(db: Session, event: BaseEvent):
+    db.add(
+        OutboxEvent(
+            id=uuid.uuid4(),
+            event_type=event.event_type,
+            aggregate_type=event.aggregate_type,
+            aggregate_id=event.aggregate_id,
+            payload=event.payload,
+            occurred_at=event.occurred_at,
+        )
     )
-
-    session.add(event)
-    return event

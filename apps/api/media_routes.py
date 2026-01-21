@@ -9,9 +9,9 @@ from fastapi import APIRouter, UploadFile, File, Depends, HTTPException, Respons
 from sqlalchemy.orm import Session
 from minio import Minio
 
-from db import SessionLocal
-from models import Media
-from auth import get_current_user
+from apps.api.db import SessionLocal
+from apps.api.models import Media
+from apps.api.auth import get_current_user
 
 
 router = APIRouter(prefix="/v1/media", tags=["media"])

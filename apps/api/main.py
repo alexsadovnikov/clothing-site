@@ -1,4 +1,5 @@
-# main.py — SINGLE SOURCE OF TRUTH
+# apps/api/main.py
+# SINGLE SOURCE OF TRUTH — API ENTRYPOINT
 
 import os
 import uuid
@@ -11,32 +12,47 @@ from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
+
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 from sqlalchemy.exc import OperationalError, ProgrammingError
 from pydantic import BaseModel
 
-from db import get_db, SessionLocal
-from storage import ensure_bucket
-from models import Category, Media, AIJob, User
-from queueing import enqueue_process_job
+
+
+# ============================================================
+# INTERNAL IMPORTS — ТОЛЬКО ЧЕРЕЗ apps.api.*
+# ============================================================
+
+from apps.api.db import get_db, SessionLocal
+from apps.api.storage import ensure_bucket
+from apps.api.models import Category, Media, AIJob, User
+from apps.api.queueing import enqueue_process_job
 
 # routers
-from auth import router as auth_router, get_current_user
-from search_routes import router as catalog_router
-from media_routes import router as media_router
+from apps.api.auth import router as auth_router, get_current_user
+from apps.api.search_routes import router as catalog_router
+from apps.api.media_routes import router as media_router
+
+# ============================================================
+# LOGGING
+# ============================================================
 
 logger = logging.getLogger(__name__)
 
 API_VERSION = os.getenv("API_VERSION", "1").strip() or "1"
 
-# ---------------------------------------------------------------------
+# ============================================================
 # APP
-# ---------------------------------------------------------------------
+# ============================================================
 
-app = FastAPI(title="Clothing API", version="0.1.0")
+app = FastAPI(
+    title="Clothing API",
+    version="0.1.0",
+)
 
 app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="*")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -44,17 +60,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ---------------------------------------------------------------------
+# ============================================================
 # ROUTERS (ЕДИНСТВЕННОЕ МЕСТО ПОДКЛЮЧЕНИЯ)
-# ---------------------------------------------------------------------
+# ============================================================
 
 app.include_router(auth_router)
 app.include_router(catalog_router)
-app.include_router(media_router)  # ← ВАЖНО: /v1/media/upload
+app.include_router(media_router)  # /v1/media/upload
 
-# ---------------------------------------------------------------------
+# ============================================================
 # ERROR HANDLING
-# ---------------------------------------------------------------------
+# ============================================================
 
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
@@ -85,18 +101,19 @@ async def add_headers_and_timing(request: Request, call_next):
     )
     return response
 
-
-# ---------------------------------------------------------------------
+# ============================================================
 # STARTUP
-# ---------------------------------------------------------------------
+# ============================================================
 
 @app.on_event("startup")
 def startup():
+    # MinIO
     try:
         ensure_bucket()
     except Exception as e:
         logger.warning("MinIO not ready: %s", e)
 
+    # DB seed
     try:
         with SessionLocal() as db:
             try:
@@ -108,12 +125,16 @@ def startup():
     except Exception as e:
         logger.warning("Seed failed (ignored): %s", e)
 
+# ============================================================
+# SEED DATA
+# ============================================================
 
 def seed_categories(db: Session) -> None:
     def get_or_create(path: str, name: str, slug: str, parent_id: str | None):
         c = db.query(Category).filter(Category.path == path).first()
         if c:
             return c
+
         c = Category(
             id=str(uuid.uuid4()),
             parent_id=parent_id,
@@ -148,19 +169,17 @@ def seed_categories(db: Session) -> None:
 
     db.commit()
 
-
-# ---------------------------------------------------------------------
+# ============================================================
 # HEALTH
-# ---------------------------------------------------------------------
+# ============================================================
 
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
-
-# ---------------------------------------------------------------------
+# ============================================================
 # AI JOBS
-# ---------------------------------------------------------------------
+# ============================================================
 
 class CreateJobReq(BaseModel):
     media_id: str
@@ -189,8 +208,13 @@ def create_ai_job(
         created_at=now,
         updated_at=now,
     )
+
     db.add(job)
     db.commit()
 
     enqueue_process_job(job_id)
-    return {"job_id": job_id, "status": "queued"}
+
+    return {
+        "job_id": job_id,
+        "status": "queued",
+    }
