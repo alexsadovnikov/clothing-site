@@ -1,4 +1,7 @@
 services:
+  # ============================================================
+  # DATABASE
+  # ============================================================
   db:
     image: postgres:16
     container_name: clothing-db
@@ -17,6 +20,9 @@ services:
       retries: 10
     restart: unless-stopped
 
+  # ============================================================
+  # REDIS
+  # ============================================================
   redis:
     image: redis:7-alpine
     container_name: clothing-redis
@@ -25,6 +31,9 @@ services:
       - "127.0.0.1:6379:6379"
     restart: unless-stopped
 
+  # ============================================================
+  # MINIO
+  # ============================================================
   minio:
     image: minio/minio:latest
     container_name: clothing-minio
@@ -39,6 +48,9 @@ services:
       - "127.0.0.1:9101:9101"
     restart: unless-stopped
 
+  # ============================================================
+  # SEARCH
+  # ============================================================
   meilisearch:
     image: getmeili/meilisearch:v1.11
     container_name: clothing-search
@@ -50,32 +62,32 @@ services:
       - "127.0.0.1:7700:7700"
     restart: unless-stopped
 
+  # ============================================================
+  # API
+  # ============================================================
   api:
-    build: ./apps/api
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
     container_name: clothing-api
     environment:
       DATABASE_URL: postgresql+psycopg2://clothing:clothing@db:5432/clothing
       REDIS_URL: redis://:redispass@redis:6379/0
-
       MINIO_ENDPOINT: http://minio:9000
       MINIO_PUBLIC_ENDPOINT: http://localhost:9100
       MINIO_ACCESS_KEY: minioadmin
       MINIO_SECRET_KEY: minioadmin
       MINIO_BUCKET: products
       MINIO_SECURE: "0"
-
       MEILI_HOST: http://meilisearch:7700
       MEILI_MASTER_KEY: masterKey
       MEILI_INDEX: products
-
       JWT_SECRET: supersecret
       JWT_ALG: HS256
       JWT_EXPIRES_MIN: "43200"
-
       PUBLIC_BASE_URL: http://localhost:8001
       PYTHONUNBUFFERED: "1"
-      
-    command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8001"]
+    command: ["uvicorn", "apps.api.main:app", "--host", "0.0.0.0", "--port", "8001"]
     ports:
       - "127.0.0.1:8001:8001"
     depends_on:
@@ -89,25 +101,24 @@ services:
         condition: service_started
     restart: unless-stopped
 
+
   worker:
-    build: ./apps/api
-    container_name: clothing-worker
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
     environment:
       DATABASE_URL: postgresql+psycopg2://clothing:clothing@db:5432/clothing
       REDIS_URL: redis://:redispass@redis:6379/0
-
       MINIO_ENDPOINT: http://minio:9000
       MINIO_ACCESS_KEY: minioadmin
       MINIO_SECRET_KEY: minioadmin
       MINIO_BUCKET: products
-
       MEILI_HOST: http://meilisearch:7700
       MEILI_MASTER_KEY: masterKey
       MEILI_INDEX: products
-
       RQ_QUEUE: clothing
       PYTHONUNBUFFERED: "1"
-    command: ["python", "worker.py"]
+    command: ["python", "apps/api/worker.py"]
     depends_on:
       db:
         condition: service_healthy
@@ -119,6 +130,27 @@ services:
         condition: service_started
     restart: unless-stopped
 
+ 
+
+  # ============================================================
+  # OUTBOX CONSUMER (DOMAIN EVENTS)
+  # ============================================================
+  outbox-consumer:
+    build: ./services/outbox_consumer
+    environment:
+      DATABASE_URL: postgresql+psycopg2://clothing:clothing@db:5432/clothing
+      PYTHONUNBUFFERED: "1"
+    command: ["python", "consumer.py"]
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+    # масштабируется ТОЛЬКО так:
+    # docker compose up -d --scale outbox-consumer=2
+
+# ============================================================
+# VOLUMES
+# ============================================================
 volumes:
   pg_data: {}
   minio_data: {}
