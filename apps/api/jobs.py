@@ -19,7 +19,7 @@ from apps.api.models import (
     ProductState,
     AIJobState,
 )
-from state_service import change_state
+from apps.api.state_service import change_state
 
 logger = logging.getLogger(__name__)
 

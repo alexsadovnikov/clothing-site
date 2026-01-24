@@ -55,3 +55,6 @@ def change_state(
     )
 
     return entity.status
+# Backward-compatible alias (older code imports change_product_state)
+change_product_state = change_state
+

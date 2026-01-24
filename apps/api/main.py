@@ -109,7 +109,7 @@ async def add_headers_and_timing(request: Request, call_next):
 def startup():
     # MinIO
     try:
-        ensure_bucket()
+        ensure_bucket(os.getenv("MINIO_BUCKET", "products"))
     except Exception as e:
         logger.warning("MinIO not ready: %s", e)
 
