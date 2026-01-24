@@ -43,3 +43,6 @@ def product_published_v1(
             "category_id": category_id,
         },
     )
+
+# Backward-compatible alias (do not use in new code)
+ProductCreated = product_created_v1

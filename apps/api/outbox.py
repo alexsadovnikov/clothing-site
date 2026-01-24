@@ -1,6 +1,14 @@
 from __future__ import annotations
 
-from datetime import datetime
+def _to_utc_naive(dt):
+    """Convert aware dt to UTC naive; keep naive as-is."""
+    if dt is None:
+        return None
+    if getattr(dt, "tzinfo", None) is None:
+        return dt
+    return dt.astimezone(timezone.utc).replace(tzinfo=None)
+
+from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy.orm import Session
@@ -31,7 +39,7 @@ def write_outbox_event(db: Session, event: BaseEvent) -> OutboxEvent:
     if isinstance(occurred_at, datetime):
         # store naive timestamp (DB is timestamp without tz)
         if occurred_at.tzinfo is not None:
-            occurred_at = occurred_at.astimezone(datetime.UTC).replace(tzinfo=None)
+            occurred_at = _to_utc_naive(occurred_at)
         else:
             occurred_at = occurred_at
     else:

@@ -19,7 +19,6 @@ from sqlalchemy.exc import OperationalError, ProgrammingError
 from pydantic import BaseModel
 
 
-
 # ============================================================
 # INTERNAL IMPORTS — ТОЛЬКО ЧЕРЕЗ apps.api.*
 # ============================================================
@@ -33,6 +32,8 @@ from apps.api.queueing import enqueue_process_job
 from apps.api.auth import router as auth_router, get_current_user
 from apps.api.search_routes import router as catalog_router
 from apps.api.media_routes import router as media_router
+from apps.api.routes.products import router as products_router
+
 
 # ============================================================
 # LOGGING
@@ -66,7 +67,9 @@ app.add_middleware(
 
 app.include_router(auth_router)
 app.include_router(catalog_router)
-app.include_router(media_router)  # /v1/media/upload
+app.include_router(media_router)     # /v1/media/upload
+app.include_router(products_router)
+
 
 # ============================================================
 # ERROR HANDLING
@@ -101,6 +104,7 @@ async def add_headers_and_timing(request: Request, call_next):
     )
     return response
 
+
 # ============================================================
 # STARTUP
 # ============================================================
@@ -124,6 +128,7 @@ def startup():
             seed_categories(db)
     except Exception as e:
         logger.warning("Seed failed (ignored): %s", e)
+
 
 # ============================================================
 # SEED DATA
@@ -169,6 +174,7 @@ def seed_categories(db: Session) -> None:
 
     db.commit()
 
+
 # ============================================================
 # HEALTH
 # ============================================================
@@ -176,6 +182,7 @@ def seed_categories(db: Session) -> None:
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
 
 # ============================================================
 # AI JOBS
