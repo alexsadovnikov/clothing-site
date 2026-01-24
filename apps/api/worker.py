@@ -4,7 +4,7 @@ import logging
 from redis import Redis
 from rq import Worker, Queue, Connection
 
-import jobs
+import apps.api.jobs as jobs
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
