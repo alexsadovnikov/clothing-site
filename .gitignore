@@ -46,3 +46,6 @@ compose.yaml.bak.*
 # Local artifacts (do not commit)
 requirements/
 tests/
+
+# local test artifacts
+/test.jpg
