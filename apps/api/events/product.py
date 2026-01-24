@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from datetime import datetime
 from uuid import UUID
 
 from apps.api.events.base import BaseEvent
@@ -25,7 +24,6 @@ def product_created_v1(
             "title": title,
             "category_id": category_id,
         },
-        occurred_at=datetime.utcnow(),
     )
 
 
@@ -44,5 +42,4 @@ def product_published_v1(
             "owner_id": str(owner_id),
             "category_id": category_id,
         },
-        occurred_at=datetime.utcnow(),
     )
