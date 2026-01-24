@@ -62,3 +62,29 @@ def upload_file_to_minio(*, file: UploadFile, object_key: str) -> Dict[str, Any]
         "size_bytes": size_bytes,
         "url": url,
     }
+
+def ensure_bucket(bucket: str | None = None) -> None:
+    """
+    Ensure bucket exists in MinIO.
+    Compatibility helper for places that expect ensure_bucket().
+    """
+    if not bucket:
+        bucket = MINIO_BUCKET
+
+    import os
+    from minio import Minio
+
+    endpoint = os.getenv("MINIO_ENDPOINT", "minio:9000")
+    access_key = os.getenv("MINIO_ACCESS_KEY", "minioadmin")
+    secret_key = os.getenv("MINIO_SECRET_KEY", "minioadmin")
+    secure = os.getenv("MINIO_SECURE", "0").lower() in ("1", "true", "yes")
+
+    client = Minio(
+        endpoint,
+        access_key=access_key,
+        secret_key=secret_key,
+        secure=secure,
+    )
+
+    if not client.bucket_exists(bucket):
+        client.make_bucket(bucket)

@@ -73,18 +73,25 @@ services:
     environment:
       DATABASE_URL: postgresql+psycopg2://clothing:clothing@db:5432/clothing
       REDIS_URL: redis://:redispass@redis:6379/0
-      MINIO_ENDPOINT: http://minio:9000
+
+      # MinIO (ВАЖНО: без http:// для minio-py)
+      MINIO_ENDPOINT: minio:9000
       MINIO_PUBLIC_ENDPOINT: http://localhost:9100
       MINIO_ACCESS_KEY: minioadmin
       MINIO_SECRET_KEY: minioadmin
       MINIO_BUCKET: products
       MINIO_SECURE: "0"
+
+      # Search
       MEILI_HOST: http://meilisearch:7700
       MEILI_MASTER_KEY: masterKey
       MEILI_INDEX: products
+
+      # Auth
       JWT_SECRET: supersecret
       JWT_ALG: HS256
       JWT_EXPIRES_MIN: "43200"
+
       PUBLIC_BASE_URL: http://localhost:8001
       PYTHONUNBUFFERED: "1"
     command: ["uvicorn", "apps.api.main:app", "--host", "0.0.0.0", "--port", "8001"]
@@ -101,7 +108,9 @@ services:
         condition: service_started
     restart: unless-stopped
 
-
+  # ============================================================
+  # WORKER
+  # ============================================================
   worker:
     build:
       context: .
@@ -109,13 +118,17 @@ services:
     environment:
       DATABASE_URL: postgresql+psycopg2://clothing:clothing@db:5432/clothing
       REDIS_URL: redis://:redispass@redis:6379/0
-      MINIO_ENDPOINT: http://minio:9000
+
+      MINIO_ENDPOINT: minio:9000
       MINIO_ACCESS_KEY: minioadmin
       MINIO_SECRET_KEY: minioadmin
       MINIO_BUCKET: products
+      MINIO_SECURE: "0"
+
       MEILI_HOST: http://meilisearch:7700
       MEILI_MASTER_KEY: masterKey
       MEILI_INDEX: products
+
       RQ_QUEUE: clothing
       PYTHONUNBUFFERED: "1"
     command: ["python", "apps/api/worker.py"]
@@ -130,13 +143,13 @@ services:
         condition: service_started
     restart: unless-stopped
 
- 
-
   # ============================================================
   # OUTBOX CONSUMER (DOMAIN EVENTS)
   # ============================================================
   outbox-consumer:
-    build: ./services/outbox_consumer
+    build:
+      context: .
+      dockerfile: services/outbox_consumer/Dockerfile
     environment:
       DATABASE_URL: postgresql+psycopg2://clothing:clothing@db:5432/clothing
       PYTHONUNBUFFERED: "1"
@@ -145,8 +158,6 @@ services:
       db:
         condition: service_healthy
     restart: unless-stopped
-    # масштабируется ТОЛЬКО так:
-    # docker compose up -d --scale outbox-consumer=2
 
 # ============================================================
 # VOLUMES
