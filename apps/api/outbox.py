@@ -50,3 +50,6 @@ def write_outbox_event(db: Session, event: BaseEvent) -> OutboxEvent:
     # flush ensures row.id is available if needed in the same transaction
     db.flush()
     return row
+
+# Backward-compatible alias
+add_outbox_event = write_outbox_event
