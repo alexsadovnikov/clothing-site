@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import uuid
-from datetime import datetime
+from enum import Enum
 
+import uuid
 from sqlalchemy import (
     Boolean,
     Column,
@@ -16,22 +16,20 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import declarative_base, relationship, synonym
 
-# ============================================================
-# BASE — ЕДИНСТВЕННЫЙ SOURCE OF TRUTH ДЛЯ ALEMBIC/ORM
-# ============================================================
-
 Base = declarative_base()
 
-# ============================================================
-# CATEGORIES (см. e2a717f7292d_init_schema.py)
-# ============================================================
 
-
+class ProductState(str, Enum):
+    DRAFT_EMPTY = "draft_empty"
+    DRAFT_READY = "draft_ready"
+    READY = "ready"
+    PUBLISHED = "published"
+    ARCHIVED = "archived"
 class Category(Base):
     __tablename__ = "categories"
 
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
-    parent_id = Column(String, ForeignKey("categories.id"), nullable=True, index=True)
+    parent_id = Column(String, ForeignKey("categories.id"), nullable=True)
 
     name = Column(String, nullable=False)
     slug = Column(String, nullable=False, index=True)
@@ -44,11 +42,6 @@ class Category(Base):
     parent = relationship("Category", remote_side=[id], backref="children")
 
 
-# ============================================================
-# USERS (см. e2a717f7292d_init_schema.py)
-# ============================================================
-
-
 class User(Base):
     __tablename__ = "users"
     __table_args__ = (UniqueConstraint("email", name="uq_users_email"),)
@@ -57,7 +50,7 @@ class User(Base):
     email = Column(String, nullable=False, index=True)
 
     password_hash = Column(String, nullable=False)
-    is_active = Column(Boolean, nullable=False, default=True)
+    is_active = Column(Boolean, nullable=False)
 
     created_at = Column(DateTime, nullable=True)
     updated_at = Column(DateTime, nullable=True)
@@ -68,37 +61,23 @@ class User(Base):
     jobs = relationship("AIJob", back_populates="user", cascade="all, delete-orphan", passive_deletes=True)
 
 
-# ============================================================
-# MEDIA (init_schema + твои новые миграции: filename, size_bytes)
-# ============================================================
-
-
 class Media(Base):
     __tablename__ = "media"
 
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
-
-    # в БД это owner_id (важно не ломать)
     owner_id = Column(String, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
 
     bucket = Column(String, nullable=False)
     object_key = Column(String, nullable=False)
 
-    # по текущей БД у тебя content_type/size_bytes/created_at могут быть nullable
     content_type = Column(String, nullable=True)
     size_bytes = Column(Integer, nullable=True)
     created_at = Column(DateTime, nullable=True)
 
-    # добавлено миграцией 733ceb074da3 (nullable=True по факту твоей БД)
     filename = Column(String, nullable=True)
 
     user = relationship("User", back_populates="media")
     jobs = relationship("AIJob", back_populates="media", cascade="all, delete-orphan", passive_deletes=True)
-
-
-# ============================================================
-# PRODUCTS (см. e2a717f7292d_init_schema.py)
-# ============================================================
 
 
 class Product(Base):
@@ -126,19 +105,12 @@ class Product(Base):
     jobs = relationship("AIJob", back_populates="draft_product")
 
 
-# ============================================================
-# AI JOBS (см. e2a717f7292d_init_schema.py)
-# ============================================================
-
-
 class AIJob(Base):
     __tablename__ = "ai_jobs"
 
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
 
-    # в БД это owner_id — оставляем как есть
     owner_id = Column(String, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
-
     status = Column(String, nullable=False)
 
     media_id = Column(String, ForeignKey("media.id", ondelete="CASCADE"), nullable=False, index=True)
@@ -154,17 +126,12 @@ class AIJob(Base):
     created_at = Column(DateTime, nullable=True)
     updated_at = Column(DateTime, nullable=True)
 
-    # для обратной совместимости кода, где могли использовать user_id
+    # совместимость со старым кодом, где могли ожидать user_id
     user_id = synonym("owner_id")
 
     user = relationship("User", back_populates="jobs")
     media = relationship("Media", back_populates="jobs")
     draft_product = relationship("Product", back_populates="jobs")
-
-
-# ============================================================
-# PRODUCT_MEDIA (см. e2a717f7292d_init_schema.py)
-# ============================================================
 
 
 class ProductMedia(Base):
