@@ -49,3 +49,7 @@ tests/
 
 # local test artifacts
 /test.jpg
+
+# python bytecode
+__pycache__/
+*.pyc
