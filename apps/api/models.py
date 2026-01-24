@@ -1,257 +1,102 @@
 from __future__ import annotations
 
-import enum
 import uuid
 from datetime import datetime
 
 from sqlalchemy import (
-    Column,
-    String,
-    DateTime,
-    Enum,
-    ForeignKey,
-    JSON,
     Boolean,
-    BigInteger,
+    Column,
+    DateTime,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
 )
-from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import declarative_base, relationship
-from sqlalchemy.sql import func
+
+# ============================================================
+# BASE — ЕДИНСТВЕННЫЙ SOURCE OF TRUTH ДЛЯ ALEMBIC
+# ============================================================
 
 Base = declarative_base()
 
 # ============================================================
-# ENUMS
+# USERS
 # ============================================================
 
-class AIJobState(str, enum.Enum):
-    QUEUED = "queued"
-    PROCESSING = "processing"
-    FAILED = "failed"
-    DONE = "done"
-
-
-class ProductState(str, enum.Enum):
-    DRAFT_EMPTY = "DRAFT_EMPTY"
-    DRAFT_READY = "DRAFT_READY"
-    READY = "READY"
-    PUBLISHED = "PUBLISHED"
-    ARCHIVED = "ARCHIVED"
-
-
-# ============================================================
-# USER
-# ============================================================
 
 class User(Base):
     __tablename__ = "users"
 
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    email = Column(String, unique=True, nullable=False)
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    email = Column(String, nullable=False, unique=True, index=True)
+
     password_hash = Column(String, nullable=False)
 
-    is_active = Column(Boolean, default=True, nullable=False)
-    deleted_at = Column(DateTime)
+    is_active = Column(Boolean, nullable=False, default=True)
 
-    created_at = Column(DateTime, server_default=func.now(), nullable=False)
-    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, nullable=True)
+    deleted_at = Column(DateTime, nullable=True)
 
-
-# ============================================================
-# CATEGORY
-# ============================================================
-
-class Category(Base):
-    __tablename__ = "categories"
-
-    id = Column(String, primary_key=True)
-    path = Column(String, nullable=False, index=True)
-    title = Column(String, nullable=False)
-
-
-# ============================================================
-# PRODUCT
-# ============================================================
-
-class Product(Base):
-    __tablename__ = "products"
-
-    id_uuid = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-
-    # legacy id (будет удалён позже)
-    id = Column(String, nullable=False, unique=True, index=True)
-
-    owner_id = Column(
-        UUID(as_uuid=True),
-        ForeignKey("users.id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
-
-    status = Column(
-        Enum(ProductState, name="product_state"),
-        nullable=False,
-        default=ProductState.DRAFT_EMPTY,
-        index=True,
-    )
-
-    title = Column(String)
-    description = Column(String)
-
-    category_id = Column(
-        String,
-        ForeignKey("categories.id"),
-        nullable=True,
-        index=True,
-    )
-
-    attributes = Column(JSON)
-    tags = Column(JSON)
-
-    created_at = Column(DateTime, server_default=func.now(), nullable=False)
-    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
-
-    # ВАЖНО: product_media — это НЕ many-to-many
-    media_items = relationship(
-        "ProductMedia",
-        back_populates="product",
+    media = relationship(
+        "Media",
+        back_populates="user",
         cascade="all, delete-orphan",
-        lazy="selectin",
+        passive_deletes=True,
+    )
+
+    jobs = relationship(
+        "AIJob",
+        back_populates="user",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
     )
 
 
 # ============================================================
-# PRODUCT MEDIA (РЕАЛЬНАЯ ТАБЛИЦА, НЕ ASSOCIATION)
+# MEDIA (СООТВЕТСТВУЕТ ТЕКУЩЕЙ БД: owner_id, bucket, object_key, size_bytes)
 # ============================================================
 
-class ProductMedia(Base):
-    __tablename__ = "product_media"
-
-    id = Column(String, primary_key=True)
-
-    product_id_uuid = Column(
-        UUID(as_uuid=True),
-        ForeignKey("products.id_uuid", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
-
-    product_id = Column(String, nullable=False)
-
-    bucket = Column(String, nullable=False)
-    object_key = Column(String, nullable=False)
-    kind = Column(String, nullable=False)
-    content_type = Column(String)
-
-    created_at = Column(DateTime, server_default=func.now(), nullable=False)
-
-    product = relationship("Product", back_populates="media_items")
-
-
-# ============================================================
-# MEDIA (как физический объект, используется AIJob)
-# ============================================================
 
 class Media(Base):
     __tablename__ = "media"
 
-    id = Column(String, primary_key=True)
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
 
-    owner_id = Column(
-        UUID(as_uuid=True),
-        ForeignKey("users.id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
+    # ВАЖНО: в БД у тебя owner_id — под него и выравниваемся
+    owner_id = Column(String, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
 
+    filename = Column(String, nullable=False)
+    content_type = Column(String, nullable=True)
+
+    size_bytes = Column(Integer, nullable=False)
     bucket = Column(String, nullable=False)
     object_key = Column(String, nullable=False)
-    content_type = Column(String, nullable=False)
 
-    size_bytes = Column(BigInteger)
-    checksum_sha256 = Column(String(64))
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
-    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    user = relationship("User", back_populates="media")
 
 
 # ============================================================
-# AI JOB
+# AI JOBS (минимально совместимо; можно уточнить после стабилизации upload)
 # ============================================================
+
 
 class AIJob(Base):
     __tablename__ = "ai_jobs"
 
-    id = Column(String, primary_key=True)
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(String, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
 
-    owner_id = Column(
-        UUID(as_uuid=True),
-        ForeignKey("users.id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
+    job_type = Column(String, nullable=False)
+    status = Column(String, nullable=False, default="pending")
 
-    media_id = Column(
-        String,
-        ForeignKey("media.id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
+    payload = Column(Text, nullable=True)
+    result = Column(Text, nullable=True)
 
-    draft_product_id_uuid = Column(
-        UUID(as_uuid=True),
-        ForeignKey("products.id_uuid", ondelete="SET NULL"),
-        nullable=True,
-        index=True,
-    )
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    finished_at = Column(DateTime, nullable=True)
 
-    status = Column(
-        Enum(AIJobState, name="ai_job_state"),
-        nullable=False,
-        default=AIJobState.QUEUED,
-        index=True,
-    )
-
-    hint = Column(JSON, default=dict)
-
-    created_at = Column(DateTime, server_default=func.now(), nullable=False)
-    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
-
-
-# ============================================================
-# OUTBOX EVENTS
-# ============================================================
-
-class OutboxEvent(Base):
-    __tablename__ = "outbox_events"
-
-    id = Column(BigInteger, primary_key=True)
-
-    event_type = Column(String, nullable=False, index=True)
-    aggregate_type = Column(String, nullable=False)
-    aggregate_id = Column(UUID(as_uuid=True), nullable=False, index=True)
-
-    payload = Column(JSON, nullable=False)
-
-    occurred_at = Column(DateTime, server_default=func.now(), nullable=False)
-    processed_at = Column(DateTime, nullable=True)
-
-
-# ============================================================
-# STATE HISTORY (AUDIT LOG)
-# ============================================================
-
-class StateHistory(Base):
-    __tablename__ = "state_history"
-
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-
-    entity_type = Column(String, nullable=False, index=True)
-    entity_id = Column(UUID(as_uuid=True), nullable=False, index=True)
-
-    from_state = Column(String, nullable=True)
-    to_state = Column(String, nullable=True)
-
-    event = Column(String, nullable=False)
-    actor = Column(String, nullable=True)
-
-    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    user = relationship("User", back_populates="jobs")

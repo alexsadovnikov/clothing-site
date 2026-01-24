@@ -1,46 +1,64 @@
 import os
-from io import BytesIO
-from typing import Optional
+from typing import Any, Dict
+
+from fastapi import UploadFile
 from minio import Minio
 
 
+MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "")
+MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "")
+MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "")
+MINIO_BUCKET = os.getenv("MINIO_BUCKET", "products")
+MINIO_SECURE = os.getenv("MINIO_SECURE", "0") == "1"
+MINIO_PUBLIC_ENDPOINT = os.getenv("MINIO_PUBLIC_ENDPOINT", "").rstrip("/")
+
+
 def _client() -> Minio:
-    endpoint = os.getenv("MINIO_ENDPOINT", "minio:9000").strip()
-    access_key = os.getenv("MINIO_ACCESS_KEY")
-    secret_key = os.getenv("MINIO_SECRET_KEY")
-    secure = os.getenv("MINIO_SECURE", "0").strip().lower() in ("1", "true", "yes")
-
-    if not access_key or not secret_key:
-        raise RuntimeError("MINIO_ACCESS_KEY/MINIO_SECRET_KEY are not set")
-
-    return Minio(endpoint, access_key=access_key, secret_key=secret_key, secure=secure)
+    endpoint = MINIO_ENDPOINT.replace("http://", "").replace("https://", "").rstrip("/")
+    return Minio(
+        endpoint,
+        access_key=MINIO_ACCESS_KEY,
+        secret_key=MINIO_SECRET_KEY,
+        secure=MINIO_SECURE,
+    )
 
 
-def ensure_bucket(bucket: Optional[str] = None) -> str:
-    b = (bucket or os.getenv("MINIO_BUCKET") or os.getenv("MINIO_BUCKET_NAME") or "products").strip()
-    if not b:
-        raise ValueError("bucket is empty")
+def upload_file_to_minio(*, file: UploadFile, object_key: str) -> Dict[str, Any]:
+    """
+    Единственная точка загрузки файлов в MinIO.
 
-    c = _client()
-    if not c.bucket_exists(b):
-        c.make_bucket(b)
-    return b
-
-
-def put_object(
-    *,
-    data: bytes,
-    content_type: str,
-    object_key: Optional[str] = None,
-    key: Optional[str] = None,
-    bucket: Optional[str] = None,
-) -> None:
-    obj_key = (object_key or key or "").strip()
-    if not obj_key:
-        raise ValueError("object_key/key is required")
-
-    b = ensure_bucket(bucket)
+    Доменный термин: object_key (используется в API/БД/логике приложения).
+    Технический термин SDK: object_name (используется только как параметр put_object).
+    """
+    if not object_key:
+        raise ValueError("object_key is required")
 
     c = _client()
-    bio = BytesIO(data)
-    c.put_object(b, obj_key, bio, length=len(data), content_type=content_type)
+
+    if not c.bucket_exists(MINIO_BUCKET):
+        c.make_bucket(MINIO_BUCKET)
+
+    data = file.file
+    data.seek(0, os.SEEK_END)
+    size_bytes = data.tell()
+    data.seek(0)
+
+    c.put_object(
+        bucket_name=MINIO_BUCKET,
+        object_name=object_key,  # SDK-параметр, значение — наш object_key
+        data=data,
+        length=size_bytes,
+        content_type=file.content_type,
+    )
+
+    # URL для скачивания/просмотра снаружи (через публичный endpoint)
+    url = ""
+    if MINIO_PUBLIC_ENDPOINT:
+        url = f"{MINIO_PUBLIC_ENDPOINT}/{MINIO_BUCKET}/{object_key}"
+
+    return {
+        "bucket": MINIO_BUCKET,
+        "object_key": object_key,
+        "size_bytes": size_bytes,
+        "url": url,
+    }
