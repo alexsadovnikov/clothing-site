@@ -87,3 +87,20 @@ def presign_get_object(*, bucket: str, object_key: str, expires_seconds: int = 9
         object_name=object_key,
         expires=timedelta(seconds=int(expires_seconds)),
     )
+
+# Backward-compatible alias required by apps/api/main.py
+def ensure_bucket(bucket: str) -> None:
+    for name in ("ensure_minio_bucket", "ensure_bucket_exists", "create_bucket_if_not_exists"):
+        fn = globals().get(name)
+        if callable(fn):
+            return fn(bucket)
+
+    get_client = globals().get("get_minio_client") or globals().get("get_client")
+    if callable(get_client):
+        client = get_client()
+        if hasattr(client, "bucket_exists") and hasattr(client, "make_bucket"):
+            if not client.bucket_exists(bucket):
+                client.make_bucket(bucket)
+            return
+
+    raise ImportError("ensure_bucket alias cannot find underlying MinIO helper in apps.api.storage")

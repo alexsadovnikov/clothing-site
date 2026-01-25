@@ -1,24 +1,32 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-cd /srv/clothing-site
+BASE="${BASE:-https://voicecrm.online/api}"
 
-echo "[1/7] git pull..."
-git pull --ff-only
-
-echo "[2/7] build+up api..."
+echo "[1/7] build + up api..."
 docker compose up -d --build api
 
-echo "[3/7] wait api healthy..."
-for i in {1..60}; do
-  if curl -fsS https://voicecrm.online/api/health >/dev/null; then
-    echo "OK: health"
-    break
+echo "[2/7] show ps..."
+docker compose ps
+
+echo "[3/7] wait api healthy (3 OK in a row)..."
+ok=0
+for i in {1..120}; do
+  if curl -fsS "${BASE}/health" >/dev/null; then
+    ok=$((ok+1))
+    if [[ $ok -ge 3 ]]; then
+      echo "OK: health stable"
+      break
+    fi
+  else
+    ok=0
   fi
+
   sleep 1
-  if [[ "$i" == "60" ]]; then
+
+  if [[ "$i" == "120" ]]; then
     echo "FAIL: api not healthy"
-    docker compose logs -n 120 api
+    docker compose logs -n 200 api
     exit 1
   fi
 done
@@ -42,6 +50,6 @@ docker compose exec -T db psql -U clothing -d clothing -Atc \
 | grep -qx "${MID2}"
 
 echo "DEPLOY OK"
-echo "PID=$PID"
-echo "MID1=$MID1"
-echo "MID2=$MID2"
+echo "PID=${PID}"
+echo "MID1=${MID1}"
+echo "MID2=${MID2}"
