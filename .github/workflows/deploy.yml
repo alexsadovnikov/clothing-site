@@ -1,0 +1,52 @@
+name: Deploy API (prod)
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch: {}
+
+concurrency:
+  group: deploy-prod
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (for metadata only)
+        uses: actions/checkout@v4
+
+      - name: Deploy reminder
+        run: |
+          echo "Deploying commit: $GITHUB_SHA"
+          echo "Repo: $GITHUB_REPOSITORY"
+
+      - name: SSH deploy on server
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: ${{ secrets.SSH_PORT || 22 }}
+          command_timeout: 60m
+          script: |
+            set -euo pipefail
+
+            cd /srv/clothing-site
+
+            echo "=== SERVER INFO ==="
+            hostname
+            date
+            echo "PWD=$(pwd)"
+
+            echo "=== GIT SYNC ==="
+            git fetch origin main
+            git reset --hard origin/main
+            git clean -fd
+
+            echo "=== DEPLOY ==="
+            ./scripts/deploy_api.sh
+
+            echo "=== POST CHECK ==="
+            curl -fsS https://voicecrm.online/api/health; echo
+            docker compose exec -T api sh -lc 'cd /app && alembic -c apps/api/alembic.ini current'
