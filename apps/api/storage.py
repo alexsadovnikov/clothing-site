@@ -1,90 +1,89 @@
+from __future__ import annotations
+
 import os
-from typing import Any, Dict
+from datetime import timedelta
+from typing import Any, Dict, Optional
 
 from fastapi import UploadFile
 from minio import Minio
 
 
-MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "")
-MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "")
-MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "")
-MINIO_BUCKET = os.getenv("MINIO_BUCKET", "products")
-MINIO_SECURE = os.getenv("MINIO_SECURE", "0") == "1"
-MINIO_PUBLIC_ENDPOINT = os.getenv("MINIO_PUBLIC_ENDPOINT", "").rstrip("/")
-
-
-def _client() -> Minio:
-    endpoint = MINIO_ENDPOINT.replace("http://", "").replace("https://", "").rstrip("/")
-    return Minio(
-        endpoint,
-        access_key=MINIO_ACCESS_KEY,
-        secret_key=MINIO_SECRET_KEY,
-        secure=MINIO_SECURE,
-    )
-
-
-def upload_file_to_minio(*, file: UploadFile, object_key: str) -> Dict[str, Any]:
-    """
-    Единственная точка загрузки файлов в MinIO.
-
-    Доменный термин: object_key (используется в API/БД/логике приложения).
-    Технический термин SDK: object_name (используется только как параметр put_object).
-    """
-    if not object_key:
-        raise ValueError("object_key is required")
-
-    c = _client()
-
-    if not c.bucket_exists(MINIO_BUCKET):
-        c.make_bucket(MINIO_BUCKET)
-
-    data = file.file
-    data.seek(0, os.SEEK_END)
-    size_bytes = data.tell()
-    data.seek(0)
-
-    c.put_object(
-        bucket_name=MINIO_BUCKET,
-        object_name=object_key,  # SDK-параметр, значение — наш object_key
-        data=data,
-        length=size_bytes,
-        content_type=file.content_type,
-    )
-
-    # URL для скачивания/просмотра снаружи (через публичный endpoint)
-    url = ""
-    if MINIO_PUBLIC_ENDPOINT:
-        url = f"{MINIO_PUBLIC_ENDPOINT}/{MINIO_BUCKET}/{object_key}"
-
-    return {
-        "bucket": MINIO_BUCKET,
-        "object_key": object_key,
-        "size_bytes": size_bytes,
-        "url": url,
-    }
-
-def ensure_bucket(bucket: str | None = None) -> None:
-    """
-    Ensure bucket exists in MinIO.
-    Compatibility helper for places that expect ensure_bucket().
-    """
-    if not bucket:
-        bucket = MINIO_BUCKET
-
-    import os
-    from minio import Minio
-
-    endpoint = os.getenv("MINIO_ENDPOINT", "minio:9000")
+def _minio_client(endpoint: str, secure: bool) -> Minio:
     access_key = os.getenv("MINIO_ACCESS_KEY", "minioadmin")
     secret_key = os.getenv("MINIO_SECRET_KEY", "minioadmin")
-    secure = os.getenv("MINIO_SECURE", "0").lower() in ("1", "true", "yes")
+    return Minio(endpoint, access_key=access_key, secret_key=secret_key, secure=secure)
 
-    client = Minio(
-        endpoint,
-        access_key=access_key,
-        secret_key=secret_key,
-        secure=secure,
+
+def get_internal_minio() -> Minio:
+    """
+    Internal endpoint reachable from containers (default: minio:9000).
+    Use this for uploads and server-to-server operations.
+    """
+    endpoint = os.getenv("MINIO_ENDPOINT", "minio:9000")
+    secure = os.getenv("MINIO_SECURE", "false").lower() == "true"
+    return _minio_client(endpoint, secure)
+
+
+def get_public_minio_for_presign() -> Minio:
+    """
+    Public endpoint used for presigned URLs (must be reachable by browser).
+    If MINIO_PUBLIC_ENDPOINT is not set, fall back to MINIO_ENDPOINT, which may break browser access.
+    """
+    endpoint = os.getenv("MINIO_PUBLIC_ENDPOINT") or os.getenv("MINIO_ENDPOINT", "minio:9000")
+    secure = os.getenv("MINIO_PUBLIC_SECURE", os.getenv("MINIO_SECURE", "false")).lower() == "true"
+    return _minio_client(endpoint, secure)
+
+
+def upload_file_to_minio(*, file: UploadFile, object_key: str, bucket: str = "products") -> Dict[str, Any]:
+    """
+    Uploads file to MinIO bucket.
+    Returns metadata about stored object.
+    """
+    c = get_internal_minio()
+
+    # Ensure bucket exists (idempotent)
+    if not c.bucket_exists(bucket):
+        c.make_bucket(bucket)
+
+    # Determine size (UploadFile may or may not support seek/tell reliably)
+    size_bytes: int = 0
+    try:
+        pos = file.file.tell()
+        file.file.seek(0, 2)
+        size_bytes = int(file.file.tell())
+        file.file.seek(pos)
+    except Exception:
+        # best-effort; DB may store 0 if unknown
+        size_bytes = 0
+
+    content_type = getattr(file, "content_type", None) or "application/octet-stream"
+
+    # Important: MinIO python SDK uses "object_name" parameter
+    c.put_object(
+        bucket_name=bucket,
+        object_name=object_key,
+        data=file.file,
+        length=size_bytes if size_bytes > 0 else -1,
+        content_type=content_type,
+        part_size=10 * 1024 * 1024,
     )
 
-    if not client.bucket_exists(bucket):
-        client.make_bucket(bucket)
+    return {
+        "bucket": bucket,
+        "object_key": object_key,
+        "content_type": content_type,
+        "size_bytes": size_bytes if size_bytes > 0 else None,
+    }
+
+
+def presign_get_object(*, bucket: str, object_key: str, expires_seconds: int = 900) -> str:
+    """
+    Generates browser-usable presigned GET URL.
+    NOTE: requires MINIO_PUBLIC_ENDPOINT to be publicly reachable for real browser access.
+    """
+    c = get_public_minio_for_presign()
+    return c.presigned_get_object(
+        bucket_name=bucket,
+        object_name=object_key,
+        expires=timedelta(seconds=int(expires_seconds)),
+    )

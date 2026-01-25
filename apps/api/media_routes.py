@@ -1,102 +1,72 @@
-import uuid
-import logging
-import traceback
-from datetime import datetime
+from __future__ import annotations
 
-from fastapi import APIRouter, Depends, File, UploadFile, Request
-from fastapi.responses import JSONResponse
+import uuid
+
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from starlette.responses import RedirectResponse
 from sqlalchemy.orm import Session
 
-from apps.api.db import get_db
 from apps.api.auth import get_current_user
-from apps.api.models import User, Media
-from apps.api.storage import upload_file_to_minio
+from apps.api.db import get_db
+from apps.api.models import Media, User
+from apps.api.storage import upload_file_to_minio, presign_get_object
 
 router = APIRouter(prefix="/v1/media", tags=["media"])
-logger = logging.getLogger("media.upload")
 
 
-@router.post("/upload", operation_id="upload_media")
+@router.post("/upload")
 def upload_media(
-    request: Request,
+    db: Session = Depends(get_db),
+    current: User = Depends(get_current_user),
     file: UploadFile = File(...),
+):
+    if not file or not getattr(file, "filename", None):
+        raise HTTPException(status_code=400, detail="file is required")
+
+    media_id = str(uuid.uuid4())
+    bucket = "products"
+    object_key = f"{current.id}/{media_id}_{file.filename}"
+
+    result = upload_file_to_minio(file=file, object_key=object_key, bucket=bucket)
+
+    # Persist Media row
+    m = Media(
+        id=media_id,
+        owner_id=current.id,
+        bucket=bucket,
+        object_key=object_key,
+        filename=file.filename or "",
+        content_type=result.get("content_type"),
+        size_bytes=(result.get("size_bytes") or 0),
+    )
+    db.add(m)
+    db.commit()
+
+    # IMPORTANT: return browser-friendly URL via API endpoint (dev/prod parity)
+    return {
+        "id": m.id,
+        "bucket": m.bucket,
+        "object_key": m.object_key,
+        "filename": m.filename,
+        "content_type": m.content_type,
+        "size_bytes": m.size_bytes,
+        "content_url": f"/api/v1/media/{m.id}/content",
+    }
+
+
+@router.get("/{media_id}/content")
+def get_media_content(
+    media_id: str,
     db: Session = Depends(get_db),
     current: User = Depends(get_current_user),
 ):
-    request_id = request.headers.get("X-Request-ID", "unknown")
+    m = db.query(Media).filter(Media.id == media_id).first()
+    if not m:
+        raise HTTPException(status_code=404, detail="media not found")
 
-    logger.info(
-        "MEDIA_UPLOAD_START request_id=%s user_id=%s filename=%s",
-        request_id,
-        current.id,
-        getattr(file, "filename", None),
-    )
+    # ACL: only owner can access
+    if m.owner_id != current.id:
+        raise HTTPException(status_code=403, detail="forbidden")
 
-    try:
-        if not file or not file.filename:
-            return JSONResponse(
-                status_code=400,
-                content={
-                    "error": "bad_request",
-                    "detail": "file is required",
-                    "request_id": request_id,
-                },
-            )
-
-        media_id = str(uuid.uuid4())
-        object_key = f"{current.id}/{media_id}_{file.filename}"
-
-        logger.debug(
-            "MINIO_UPLOAD request_id=%s object_key=%s content_type=%s",
-            request_id,
-            object_key,
-            file.content_type,
-        )
-
-        result = upload_file_to_minio(file=file, object_key=object_key)
-
-        logger.debug("MINIO_RESULT request_id=%s result=%s", request_id, result)
-
-        media = Media(
-            id=media_id,
-            owner_id=current.id,
-            filename=file.filename,              # ✅ ВОТ ЭТОГО НЕ ХВАТАЛО
-            bucket=result["bucket"],
-            object_key=result["object_key"],
-            content_type=file.content_type,
-            size_bytes=result["size_bytes"],
-            created_at=datetime.utcnow(),
-        )
-
-        db.add(media)
-        db.commit()
-        db.refresh(media)
-
-        logger.info(
-            "MEDIA_UPLOAD_OK request_id=%s media_id=%s",
-            request_id,
-            media.id,
-        )
-
-        return {
-            "id": media.id,
-            "bucket": media.bucket,
-            "object_key": media.object_key,
-            "filename": media.filename,          # ✅ можно вернуть тоже
-            "content_type": media.content_type,
-            "size_bytes": media.size_bytes,
-            "url": result["url"],
-        }
-
-    except Exception as e:
-        logger.error("MEDIA_UPLOAD_FAILED request_id=%s error=%s", request_id, str(e))
-        logger.error("TRACEBACK request_id=%s\n%s", request_id, traceback.format_exc())
-
-        return JSONResponse(
-            status_code=500,
-            content={
-                "error": "internal_error",
-                "detail": str(e),
-                "request_id": request_id,
-            },
-        )
+    url = presign_get_object(bucket=m.bucket, object_key=m.object_key, expires_seconds=900)
+    return RedirectResponse(url=url, status_code=302)
