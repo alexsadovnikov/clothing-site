@@ -6,9 +6,8 @@ import uuid
 import time
 import logging
 from datetime import datetime
-from typing import Any
 
-from fastapi import FastAPI, HTTPException, Depends, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
@@ -16,31 +15,30 @@ from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 from sqlalchemy.exc import OperationalError, ProgrammingError
-from pydantic import BaseModel
-
 
 # ============================================================
 # INTERNAL IMPORTS — ТОЛЬКО ЧЕРЕЗ apps.api.*
 # ============================================================
 
-from apps.api.db import get_db, SessionLocal
+from apps.api.db import SessionLocal
+from apps.api.models import Category
 from apps.api.storage import ensure_bucket
-from apps.api.models import Category, Media, AIJob, User
-from apps.api.queueing import enqueue_process_job
 
 # routers
-from apps.api.auth import router as auth_router, get_current_user
+from apps.api.auth import router as auth_router
 from apps.api.search_routes import router as catalog_router
 from apps.api.media_routes import router as media_router
 from apps.api.routes.products import router as products_router
+from apps.api.routes.ai_jobs import router as ai_jobs_router  # ✅ ВАЖНО
 
+# NEW: internal AI endpoint for worker (/v1/analyze)
+from apps.api.routes.ai_internal import router as ai_internal_router
 
 # ============================================================
 # LOGGING
 # ============================================================
 
 logger = logging.getLogger(__name__)
-
 API_VERSION = os.getenv("API_VERSION", "1").strip() or "1"
 
 # ============================================================
@@ -62,14 +60,17 @@ app.add_middleware(
 )
 
 # ============================================================
-# ROUTERS (ЕДИНСТВЕННОЕ МЕСТО ПОДКЛЮЧЕНИЯ)
+# ROUTERS
 # ============================================================
 
 app.include_router(auth_router)
 app.include_router(catalog_router)
-app.include_router(media_router)     # /v1/media/upload
-app.include_router(products_router)
+app.include_router(media_router)        # /v1/media/...
+app.include_router(products_router)     # /v1/products/...
+app.include_router(ai_jobs_router)      # ✅ /v1/ai/jobs (POST/GET)
 
+# NEW: /v1/analyze
+app.include_router(ai_internal_router)
 
 # ============================================================
 # ERROR HANDLING
@@ -99,11 +100,8 @@ async def add_headers_and_timing(request: Request, call_next):
     t0 = time.perf_counter()
     response = await call_next(request)
     response.headers["API-Version"] = API_VERSION
-    response.headers["X-Response-Time-ms"] = str(
-        int((time.perf_counter() - t0) * 1000)
-    )
+    response.headers["X-Response-Time-ms"] = str(int((time.perf_counter() - t0) * 1000))
     return response
-
 
 # ============================================================
 # STARTUP
@@ -129,7 +127,6 @@ def startup():
     except Exception as e:
         logger.warning("Seed failed (ignored): %s", e)
 
-
 # ============================================================
 # SEED DATA
 # ============================================================
@@ -143,7 +140,7 @@ def seed_categories(db: Session) -> None:
         c = Category(
             id=str(uuid.uuid4()),
             parent_id=parent_id,
-            name=name,
+            name=name,  # ✅ FIX
             slug=slug,
             path=path,
             is_active=True,
@@ -174,7 +171,6 @@ def seed_categories(db: Session) -> None:
 
     db.commit()
 
-
 # ============================================================
 # HEALTH
 # ============================================================
@@ -182,46 +178,3 @@ def seed_categories(db: Session) -> None:
 @app.get("/health")
 def health():
     return {"status": "ok"}
-
-
-# ============================================================
-# AI JOBS
-# ============================================================
-
-class CreateJobReq(BaseModel):
-    media_id: str
-    hint: dict[str, Any] | None = None
-
-
-@app.post("/v1/ai/jobs")
-def create_ai_job(
-    payload: CreateJobReq,
-    db: Session = Depends(get_db),
-    current: User = Depends(get_current_user),
-):
-    media = db.query(Media).filter(Media.id == payload.media_id).first()
-    if not media or media.owner_id != current.id:
-        raise HTTPException(status_code=404, detail="media not found")
-
-    job_id = str(uuid.uuid4())
-    now = datetime.utcnow()
-
-    job = AIJob(
-        id=job_id,
-        owner_id=current.id,
-        media_id=media.id,
-        status="queued",
-        hint=payload.hint or {},
-        created_at=now,
-        updated_at=now,
-    )
-
-    db.add(job)
-    db.commit()
-
-    enqueue_process_job(job_id)
-
-    return {
-        "job_id": job_id,
-        "status": "queued",
-    }

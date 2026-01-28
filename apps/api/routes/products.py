@@ -14,6 +14,7 @@ from apps.api.auth import get_current_user
 from apps.api.models import Product, ProductState, User, Media, ProductMedia
 from apps.api.events.product import product_created_v1
 from apps.api.outbox import write_outbox_event
+from apps.api.state_service import change_state, StateTransitionError
 
 router = APIRouter(prefix="/v1/products", tags=["products"])
 
@@ -36,6 +37,11 @@ class PatchProductReq(BaseModel):
     category_id: Optional[str] = None
     attributes: Optional[dict] = None
     tags: Optional[list] = None
+
+    # IMPORTANT:
+    # Это поле исторически называлось "status", но по смыслу для state machine
+    # мы трактуем его как "event/transition" (prepare/ready/publish/archive/ready_for_publish).
+    # Также поддержим ситуацию, когда передают значение state (draft_ready/ready/...)
     status: Optional[str] = None
 
 
@@ -45,7 +51,7 @@ class AttachMediaReq(BaseModel):
 
 
 # ============================================================
-# Pydantic схемы (responses) — чтобы OpenAPI был нормальным
+# Pydantic схемы (responses)
 # ============================================================
 
 class MediaOut(BaseModel):
@@ -110,6 +116,69 @@ class ProductMediaListOut(BaseModel):
 
 
 # ============================================================
+# Helpers
+# ============================================================
+
+def _product_to_out(p: Product) -> dict:
+    return {
+        "id": p.id,
+        "owner_id": p.owner_id,
+        "status": p.status,
+        "title": p.title,
+        "description": p.description,
+        "category_id": p.category_id,
+        "attributes": p.attributes,
+        "tags": p.tags,
+        "created_at": p.created_at.isoformat() if p.created_at else None,
+        "updated_at": p.updated_at.isoformat() if p.updated_at else None,
+    }
+
+
+def _normalize_status_input_to_event(p: Product, value: str) -> str:
+    """
+    Backward compatibility:
+    - если пришло имя transition/event (prepare/ready/publish/archive/ready_for_publish) — вернём как есть
+    - если пришло значение state (draft_ready/ready/published/...) — подберём event из текущего p.status
+    """
+    v = (value or "").strip().lower()
+    if not v:
+        raise HTTPException(status_code=422, detail="status is empty")
+
+    # 1) если это уже event
+    known_events = {"prepare", "ready", "ready_for_publish", "publish", "archive"}
+    if v in known_events:
+        return v
+
+    # 2) если это state value
+    all_states = {s.value for s in ProductState}
+    if v not in all_states:
+        raise HTTPException(status_code=422, detail=f"Unknown status/event '{value}'")
+
+    # минимальная “карта” state->event (один шаг)
+    current = (p.status or "").strip().lower()
+
+    # хотим попасть в v за один transition (или alias ready_for_publish)
+    if current == ProductState.DRAFT_EMPTY.value and v == ProductState.DRAFT_READY.value:
+        return "prepare"
+    if current == ProductState.DRAFT_EMPTY.value and v == ProductState.READY.value:
+        return "ready_for_publish"
+
+    if current == ProductState.DRAFT_READY.value and v == ProductState.READY.value:
+        return "ready"
+
+    if current == ProductState.READY.value and v == ProductState.PUBLISHED.value:
+        return "publish"
+
+    if current == ProductState.PUBLISHED.value and v == ProductState.ARCHIVED.value:
+        return "archive"
+
+    raise HTTPException(
+        status_code=409,
+        detail=f"Cannot transition from '{current}' to '{v}' in one step",
+    )
+
+
+# ============================================================
 # Products
 # ============================================================
 
@@ -135,21 +204,7 @@ def list_my_products(
     )
 
     return {
-        "items": [
-            {
-                "id": p.id,
-                "owner_id": p.owner_id,
-                "status": p.status,
-                "title": p.title,
-                "description": p.description,
-                "category_id": p.category_id,
-                "attributes": p.attributes,
-                "tags": p.tags,
-                "created_at": p.created_at.isoformat() if p.created_at else None,
-                "updated_at": p.updated_at.isoformat() if p.updated_at else None,
-            }
-            for p in items
-        ],
+        "items": [_product_to_out(p) for p in items],
         "limit": limit,
         "offset": offset,
         "total": total,
@@ -186,6 +241,7 @@ def create_draft_product(
     write_outbox_event(db, evt)
 
     db.commit()
+    db.refresh(p)
 
     return {"id": p.id, "status": p.status}
 
@@ -204,18 +260,7 @@ def get_product(
     if not p:
         raise HTTPException(status_code=404, detail="Not Found")
 
-    return {
-        "id": p.id,
-        "owner_id": p.owner_id,
-        "status": p.status,
-        "title": p.title,
-        "description": p.description,
-        "category_id": p.category_id,
-        "attributes": p.attributes,
-        "tags": p.tags,
-        "created_at": p.created_at.isoformat() if p.created_at else None,
-        "updated_at": p.updated_at.isoformat() if p.updated_at else None,
-    }
+    return _product_to_out(p)
 
 
 @router.patch("/{product_id}", response_model=ProductOut)
@@ -235,30 +280,30 @@ def patch_product(
 
     data = body.dict(exclude_unset=True)
 
-    allowed = {"title", "description", "category_id", "attributes", "tags", "status"}
-    for k in list(data.keys()):
-        if k not in allowed:
-            data.pop(k, None)
+    # обычные поля
+    for k in ("title", "description", "category_id", "attributes", "tags"):
+        if k in data:
+            setattr(p, k, data[k])
 
-    for k, v in data.items():
-        setattr(p, k, v)
+    # status -> трактуем как event/state-machine
+    if "status" in data and data["status"] is not None:
+        event = _normalize_status_input_to_event(p, data["status"])
+        try:
+            change_state(
+                db=db,
+                entity=p,
+                entity_type="product",
+                event=event,
+                actor_id=current.id,
+            )
+        except StateTransitionError as e:
+            raise HTTPException(status_code=409, detail=str(e))
 
     db.add(p)
     db.commit()
     db.refresh(p)
 
-    return {
-        "id": p.id,
-        "owner_id": p.owner_id,
-        "status": p.status,
-        "title": p.title,
-        "description": p.description,
-        "category_id": p.category_id,
-        "attributes": p.attributes,
-        "tags": p.tags,
-        "created_at": p.created_at.isoformat() if p.created_at else None,
-        "updated_at": p.updated_at.isoformat() if p.updated_at else None,
-    }
+    return _product_to_out(p)
 
 
 @router.post("/{product_id}/publish", response_model=ProductPublishOut)
@@ -275,8 +320,17 @@ def publish_product(
     if not p:
         raise HTTPException(status_code=404, detail="Not Found")
 
-    p.status = ProductState.PUBLISHED.value
-    db.add(p)
+    try:
+        change_state(
+            db=db,
+            entity=p,
+            entity_type="product",
+            event="publish",
+            actor_id=current.id,
+        )
+    except StateTransitionError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+
     db.commit()
     db.refresh(p)
 
@@ -409,7 +463,6 @@ def list_product_media(
         .all()
     )
 
-    # Нормализованный контракт: media вложенным объектом
     return {
         "items": [
             {
