@@ -5,27 +5,15 @@ import time
 import logging
 from datetime import datetime
 from typing import Optional, Tuple
-from uuid import UUID
 
 import requests
 from meilisearch import Client as MeiliClient
 
 from apps.api.db import SessionLocal
-from apps.api.models import (
-    AIJob,
-    Media,
-    Product,
-    Category,
-    ProductState,
-    AIJobState,
-)
+from apps.api.models import AIJob, Media, Product, ProductState, AIJobState
 from apps.api.state_service import change_state
 
 logger = logging.getLogger(__name__)
-
-# =============================================================================
-# MEILI CONFIG
-# =============================================================================
 
 _MEILI_FILTERABLE = ["status", "owner_id", "category_id", "tags"]
 _MEILI_SORTABLE = ["updated_at"]
@@ -65,10 +53,6 @@ def _wait_task(client: MeiliClient, task_uid: int, timeout_s: int = 30) -> None:
         time.sleep(0.25)
 
 
-# =============================================================================
-# MEILI INIT (SAFE FOR WORKER)
-# =============================================================================
-
 def init_meili() -> None:
     host, key, index_name = _meili_cfg()
     if not host or not key:
@@ -77,16 +61,14 @@ def init_meili() -> None:
 
     client = MeiliClient(host, key)
 
-    # ensure index exists
     try:
         idx = client.get_index(index_name)
     except Exception:
-        task = client.create_index(index_name, {"primaryKey": "id_uuid"})
+        task = client.create_index(index_name, {"primaryKey": "id"})
         if (uid := _task_uid(task)):
             _wait_task(client, uid)
         idx = client.get_index(index_name)
 
-    # ensure settings
     settings = idx.get_settings()
     tasks: list[int] = []
 
@@ -104,10 +86,6 @@ def init_meili() -> None:
     logger.info("[meili] ready index=%s", index_name)
 
 
-# =============================================================================
-# HELPERS
-# =============================================================================
-
 def _update_product_text(product: Product, ai: dict) -> None:
     if not product.title and ai.get("title_suggested"):
         product.title = ai["title_suggested"]
@@ -116,68 +94,111 @@ def _update_product_text(product: Product, ai: dict) -> None:
         product.description = ai.get("description_draft") or "Описание будет уточнено."
 
 
-# =============================================================================
-# MAIN AI JOB
-# =============================================================================
+def _set_ai_job_state(*, job: AIJob, status: str, error: str | None = None) -> None:
+    job.status = status
+    job.updated_at = datetime.utcnow()
+
+    if status in (AIJobState.RUNNING.value, AIJobState.SUCCEEDED.value):
+        job.error = None
+
+    if error is not None:
+        job.error = error
+
+
+def _ai_internal_base_url() -> str:
+    # worker calls api service in docker network
+    return (os.getenv("AI_INTERNAL_URL") or "http://api:8001").strip().rstrip("/")
+
+
+def _ai_internal_token() -> str:
+    # shared internal token (worker->api and api->gateway)
+    return (os.getenv("AI_INTERNAL_TOKEN") or "").strip()
+
+
+def _safe_json(resp: requests.Response) -> dict:
+    try:
+        data = resp.json() or {}
+    except Exception as e:
+        raise ValueError(f"AI response is not JSON: {e}") from e
+
+    if not isinstance(data, dict):
+        raise ValueError("AI response must be a JSON object")
+
+    return data
+
 
 def process_ai_job(job_id: str) -> None:
     """
     Worker entrypoint.
-    Полный цикл:
-    AIJob → AI → Product(DRAFT) → link → DONE
+    AIJob -> call internal /v1/analyze -> create Product(DRAFT) -> transition -> SUCCEEDED/FAILED
     """
     t0 = time.perf_counter()
 
-    # ------------------------------------------------------------------
-    # 1️⃣ LOAD JOB + MEDIA
-    # ------------------------------------------------------------------
     with SessionLocal() as db:
         job = db.query(AIJob).filter(AIJob.id == job_id).first()
         if not job:
             logger.warning("ai_job not found job_id=%s", job_id)
             return
 
-        job.status = AIJobState.PROCESSING
-        job.updated_at = datetime.utcnow()
-        change_state(db, job, "ai_job", "start_processing", "system")
+        if job.status == AIJobState.SUCCEEDED.value and job.draft_product_id:
+            if job.error:
+                _set_ai_job_state(job=job, status=AIJobState.SUCCEEDED.value, error=None)
+                db.commit()
+
+            logger.info(
+                "[ai] job already succeeded job_id=%s draft_product_id=%s",
+                job_id,
+                job.draft_product_id,
+            )
+            return
+
+        _set_ai_job_state(job=job, status=AIJobState.RUNNING.value)
 
         media = db.query(Media).filter(Media.id == job.media_id).first()
         if not media:
-            job.status = AIJobState.FAILED
-            job.error = "media not found"
+            _set_ai_job_state(job=job, status=AIJobState.FAILED.value, error="media not found")
             db.commit()
             return
 
+        media_bucket = media.bucket
+        media_object_key = media.object_key
         db.commit()
 
-    # ------------------------------------------------------------------
-    # 2️⃣ CALL AI SERVICE
-    # ------------------------------------------------------------------
+    base = _ai_internal_base_url()
+    url = f"{base}/v1/analyze"
+
+    token = _ai_internal_token()
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["X-AI-Internal-Token"] = token  # <-- КЛЮЧЕВОЙ ФИКС
+
     try:
         resp = requests.post(
-            f"{os.getenv('AI_INTERNAL_URL', 'http://ai:8002')}/v1/analyze",
-            json={"bucket": media.bucket, "object_key": media.object_key},
-            timeout=(5, 120),
+            url,
+            json={"bucket": media_bucket, "object_key": media_object_key},
+            headers=headers,
+            timeout=(5, 180),
         )
         resp.raise_for_status()
-        result = resp.json() or {}
+        result = _safe_json(resp)
+
     except Exception as e:
         with SessionLocal() as db:
             job = db.query(AIJob).filter(AIJob.id == job_id).first()
             if job:
-                job.status = AIJobState.FAILED
-                job.error = str(e)
-                job.updated_at = datetime.utcnow()
-                change_state(db, job, "ai_job", "ai_failed", "system")
+                _set_ai_job_state(job=job, status=AIJobState.FAILED.value, error=str(e))
                 db.commit()
-        logger.exception("AI request failed job_id=%s", job_id)
-        return
 
-    # ------------------------------------------------------------------
-    # 3️⃣ CREATE PRODUCT (UUID PK)
-    # ------------------------------------------------------------------
+        logger.exception("AI request failed job_id=%s url=%s", job_id, url)
+        raise
+
+    product_id: str | None = None
+
     with SessionLocal() as db:
         job = db.query(AIJob).filter(AIJob.id == job_id).first()
+        if not job:
+            logger.warning("ai_job disappeared job_id=%s", job_id)
+            return
 
         product = Product(
             owner_id=job.owner_id,
@@ -185,29 +206,81 @@ def process_ai_job(job_id: str) -> None:
             title="Товар (черновик)",
             attributes={},
             tags=[],
-            created_at=datetime.utcnow(),
-            updated_at=datetime.utcnow(),
         )
         db.add(product)
-        db.flush()  # ⬅️ id_uuid доступен
+        db.flush()
+
+        product_id = product.id
 
         _update_product_text(product, result)
         product.attributes = result.get("attributes") or {}
         product.tags = result.get("tags") or []
 
-        job.status = AIJobState.DONE
-        job.draft_product_id_uuid = product.id_uuid
-        job.result = result
-        job.updated_at = datetime.utcnow()
+        _set_ai_job_state(job=job, status=AIJobState.SUCCEEDED.value)
+        job.draft_product_id = product.id
+        job.result_json = result
 
-        change_state(db, job, "ai_job", "ai_done", "system")
-        change_state(db, product, "product", "ready_for_publish", "system")
+        try:
+            change_state(
+                db=db,
+                entity=product,
+                entity_type="product",
+                event="ready_for_publish",
+                actor_id="system",
+                meta={"source": "ai_job", "job_id": job_id},
+            )
+        except Exception:
+            logger.exception(
+                "Product state transition failed product_id=%s job_id=%s",
+                getattr(product, "id", None),
+                job_id,
+            )
 
         db.commit()
 
     logger.info(
-        "[ai] job done job_id=%s product_id_uuid=%s ms=%s",
+        "[ai] job done job_id=%s product_id=%s ms=%s",
         job_id,
-        product.id_uuid,
+        product_id,
+        int((time.perf_counter() - t0) * 1000),
+    )
+
+
+def index_product(product_id: str) -> None:
+    t0 = time.perf_counter()
+
+    host, key, index_name = _meili_cfg()
+    if not host or not key:
+        logger.info("[meili] index skipped (not configured) product_id=%s", product_id)
+        return
+
+    with SessionLocal() as db:
+        p = db.query(Product).filter(Product.id == product_id).first()
+        if not p:
+            logger.warning("[meili] product not found product_id=%s", product_id)
+            return
+
+        doc = {
+            "id": p.id,
+            "owner_id": p.owner_id,
+            "status": p.status,
+            "title": p.title,
+            "description": p.description,
+            "category_id": p.category_id,
+            "tags": p.tags or [],
+            "updated_at": p.updated_at.isoformat() if getattr(p, "updated_at", None) else None,
+        }
+
+    client = MeiliClient(host, key)
+    idx = client.index(index_name)
+    task = idx.add_documents([doc])
+
+    if (uid := _task_uid(task)):
+        _wait_task(client, uid)
+
+    logger.info(
+        "[meili] indexed product_id=%s index=%s ms=%s",
+        product_id,
+        index_name,
         int((time.perf_counter() - t0) * 1000),
     )
