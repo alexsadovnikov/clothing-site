@@ -28,12 +28,10 @@ Base = declarative_base()
 # ============================================================
 
 class CreatedAtMixin:
-    # timestamp without time zone DEFAULT now() NOT NULL
     created_at = Column(DateTime(timezone=False), nullable=False, server_default=func.now())
 
 
 class TimestampsMixin(CreatedAtMixin):
-    # timestamp without time zone DEFAULT now() NOT NULL
     updated_at = Column(
         DateTime(timezone=False),
         nullable=False,
@@ -59,6 +57,33 @@ class AIJobState(str, Enum):
     RUNNING = "running"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
+
+    # совместимость с кодом, который мог ожидать эти имена
+    PROCESSING = "running"
+    DONE = "succeeded"
+
+    @classmethod
+    def terminal(cls) -> set[str]:
+        return {cls.SUCCEEDED.value, cls.FAILED.value}
+
+    @classmethod
+    def active(cls) -> set[str]:
+        return {cls.QUEUED.value, cls.RUNNING.value}
+
+    @classmethod
+    def normalize(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        v = str(v).strip().lower()
+        mapping = {
+            "queued": cls.QUEUED.value,
+            "running": cls.RUNNING.value,
+            "processing": cls.RUNNING.value,
+            "done": cls.SUCCEEDED.value,
+            "succeeded": cls.SUCCEEDED.value,
+            "failed": cls.FAILED.value,
+        }
+        return mapping.get(v, v)
 
 
 # ============================================================
@@ -149,7 +174,6 @@ class Media(Base, CreatedAtMixin):
         passive_deletes=True,
     )
 
-    # Не обязательно, но удобно: смотреть где медиа используется у продуктов
     product_links = relationship(
         "ProductMedia",
         back_populates="media",
@@ -196,7 +220,7 @@ class Product(Base, TimestampsMixin):
 
 
 # ============================================================
-# PRODUCT MEDIA  (ВАЖНО: только одна версия, совпадает с БД)
+# PRODUCT MEDIA
 # ============================================================
 
 class ProductMedia(Base, CreatedAtMixin):
@@ -213,7 +237,7 @@ class ProductMedia(Base, CreatedAtMixin):
 
     media_id = Column(
         String,
-        ForeignKey("media.id", ondelete="RESTRICT"),  # как в БД: ON DELETE RESTRICT
+        ForeignKey("media.id", ondelete="RESTRICT"),
         nullable=False,
         index=True,
     )
@@ -221,7 +245,7 @@ class ProductMedia(Base, CreatedAtMixin):
     kind = Column(String, nullable=False)
 
     product = relationship("Product", back_populates="media")
-    media = relationship("Media")
+    media = relationship("Media", back_populates="product_links")
 
 
 # ============================================================
@@ -265,23 +289,10 @@ class AIJob(Base, TimestampsMixin):
 
 
 # ============================================================
-# OUTBOX (CANONICAL)
+# OUTBOX
 # ============================================================
 
 class OutboxEvent(Base):
-    """
-    Canonical schema must match db/init/001_schema.sql:
-
-      outbox_events (
-        id bigserial PK,
-        event_type varchar not null,
-        aggregate_type varchar not null,
-        aggregate_id varchar not null,
-        payload json not null,
-        occurred_at timestamp not null default now(),
-        processed_at timestamp null
-      )
-    """
     __tablename__ = "outbox_events"
 
     id = Column(BigInteger, primary_key=True, autoincrement=True)
@@ -298,12 +309,11 @@ class OutboxEvent(Base):
     __table_args__ = (
         Index("ix_outbox_events_event_type", "event_type"),
         Index("ix_outbox_events_aggregate_id", "aggregate_id"),
-        # partial index ix_outbox_events_unprocessed is created by init SQL
     )
 
 
 # ============================================================
-# (Optional / future domain models)
+# OPTIONAL / FUTURE MODELS
 # ============================================================
 
 class StateHistory(Base):
