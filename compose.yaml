@@ -1,3 +1,55 @@
+name: clothing-site
+
+x-minio-env: &minio_env
+  MINIO_ENDPOINT: "minio:9000"
+  MINIO_ACCESS_KEY: "minioadmin"
+  MINIO_SECRET_KEY: "minioadmin"
+  MINIO_BUCKET: "products"
+  MINIO_SECURE: "0"
+  MINIO_REGION: "us-east-1"
+  MINIO_PUBLIC_ENDPOINT: "http://127.0.0.1:9100"
+  MEDIA_PUBLIC_BASE_URL: "http://127.0.0.1:9100"
+
+x-meili-env: &meili_env
+  MEILI_HOST: "http://meilisearch:7700"
+  MEILI_MASTER_KEY: "masterKey"
+  MEILI_INDEX: "products"
+
+x-runtime-env: &runtime_env
+  PYTHONUNBUFFERED: "1"
+  LOG_LEVEL: "INFO"
+
+x-db-env: &db_env
+  DATABASE_URL: "postgresql+psycopg2://clothing:clothing@db:5432/clothing"
+  REDIS_URL: "redis://:redispass@redis:6379/0"
+
+x-ai-env: &ai_env
+  # on/off + provider
+  AI_ENABLED: "${AI_ENABLED:-true}"
+  AI_PROVIDER: "${AI_PROVIDER:-gateway}"
+
+
+  # gateway endpoint (EU VPS)
+  AI_GATEWAY_URL: "${AI_GATEWAY_URL:-https://ai.voicecrm.online}"
+  AI_GATEWAY_TIMEOUT_S: "${AI_GATEWAY_TIMEOUT_S:-60}"
+
+  # internal auth for worker -> api and api -> gateway
+  # (НЕ задаём дефолт, чтобы не получить 401 и не искать 2 часа)
+  AI_INTERNAL_TOKEN: "${AI_INTERNAL_TOKEN}"
+
+  # OpenAI (в РФ можно не задавать вообще)
+  OPENAI_API_KEY: "${OPENAI_API_KEY}"
+  OPENAI_MODEL: "${OPENAI_MODEL:-gpt-4o-mini}"
+  OPENAI_TIMEOUT_S: "${OPENAI_TIMEOUT_S:-45}"
+  OPENAI_MAX_TOKENS: "${OPENAI_MAX_TOKENS:-600}"
+  OPENAI_TEMPERATURE: "${OPENAI_TEMPERATURE:-0.2}"
+
+  # policies
+  AI_MAX_RETRIES: "${AI_MAX_RETRIES:-3}"
+  AI_RETRY_BACKOFF_S: "${AI_RETRY_BACKOFF_S:-2}"
+  AI_MAX_IMAGE_MB: "${AI_MAX_IMAGE_MB:-15}"
+  AI_STRICT_JSON: "${AI_STRICT_JSON:-1}"
+
 services:
   # ============================================================
   # DATABASE
@@ -6,9 +58,9 @@ services:
     image: postgres:16
     container_name: clothing-db
     environment:
-      POSTGRES_DB: clothing
-      POSTGRES_USER: clothing
-      POSTGRES_PASSWORD: clothing
+      POSTGRES_DB: "clothing"
+      POSTGRES_USER: "clothing"
+      POSTGRES_PASSWORD: "clothing"
     volumes:
       - pg_data:/var/lib/postgresql/data
     ports:
@@ -38,9 +90,9 @@ services:
     image: minio/minio:latest
     container_name: clothing-minio
     environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
-    command: server /data --console-address ":9101"
+      MINIO_ROOT_USER: "minioadmin"
+      MINIO_ROOT_PASSWORD: "minioadmin"
+    command: ["server", "/data", "--console-address", ":9101"]
     volumes:
       - minio_data:/data
     ports:
@@ -55,7 +107,7 @@ services:
     image: getmeili/meilisearch:v1.11
     container_name: clothing-search
     environment:
-      MEILI_MASTER_KEY: masterKey
+      MEILI_MASTER_KEY: "masterKey"
     volumes:
       - meili_data:/meili_data
     ports:
@@ -71,30 +123,20 @@ services:
       dockerfile: apps/api/Dockerfile
     container_name: clothing-api
     environment:
-      DATABASE_URL: postgresql+psycopg2://clothing:clothing@db:5432/clothing
-      REDIS_URL: redis://:redispass@redis:6379/0
-
-      # MinIO (ВАЖНО: без http:// для minio-py)
-      MINIO_ENDPOINT: minio:9000
-      MINIO_PUBLIC_ENDPOINT: http://localhost:9100
-      MINIO_ACCESS_KEY: minioadmin
-      MINIO_SECRET_KEY: minioadmin
-      MINIO_BUCKET: products
-      MINIO_SECURE: "0"
-
-      # Search
-      MEILI_HOST: http://meilisearch:7700
-      MEILI_MASTER_KEY: masterKey
-      MEILI_INDEX: products
+      <<: [*db_env, *minio_env, *meili_env, *runtime_env, *ai_env]
 
       # Auth
-      JWT_SECRET: supersecret
-      JWT_ALG: HS256
+      JWT_SECRET: "supersecret"
+      JWT_ALG: "HS256"
       JWT_EXPIRES_MIN: "43200"
 
-      PUBLIC_BASE_URL: http://localhost:8001
-      PYTHONUNBUFFERED: "1"
-    command: ["uvicorn", "apps.api.main:app", "--host", "0.0.0.0", "--port", "8001"]
+      # Public URLs (dev)
+      PUBLIC_BASE_URL: "http://127.0.0.1:8001"
+
+      # Runtime extras
+      UPLOAD_MAX_BYTES: "15000000"
+
+    command: ["uvicorn", "apps.api.main:app", "--host", "0.0.0.0", "--port", "8001", "--log-level", "debug"]
     ports:
       - "127.0.0.1:8001:8001"
     depends_on:
@@ -109,28 +151,22 @@ services:
     restart: unless-stopped
 
   # ============================================================
-  # WORKER
+  # WORKER (AI + background jobs)
   # ============================================================
   worker:
     build:
       context: .
       dockerfile: apps/api/Dockerfile
+    container_name: clothing-worker
     environment:
-      DATABASE_URL: postgresql+psycopg2://clothing:clothing@db:5432/clothing
-      REDIS_URL: redis://:redispass@redis:6379/0
+      <<: [*db_env, *minio_env, *meili_env, *runtime_env, *ai_env]
 
-      MINIO_ENDPOINT: minio:9000
-      MINIO_ACCESS_KEY: minioadmin
-      MINIO_SECRET_KEY: minioadmin
-      MINIO_BUCKET: products
-      MINIO_SECURE: "0"
+      # Queue
+      RQ_QUEUE: "clothing"
 
-      MEILI_HOST: http://meilisearch:7700
-      MEILI_MASTER_KEY: masterKey
-      MEILI_INDEX: products
+      # Where worker calls API (docker network)
+      AI_INTERNAL_URL: "http://api:8001"
 
-      RQ_QUEUE: clothing
-      PYTHONUNBUFFERED: "1"
     command: ["python", "apps/api/worker.py"]
     depends_on:
       db:
@@ -141,6 +177,8 @@ services:
         condition: service_started
       meilisearch:
         condition: service_started
+      api:
+        condition: service_started
     restart: unless-stopped
 
   # ============================================================
@@ -150,18 +188,16 @@ services:
     build:
       context: .
       dockerfile: services/outbox_consumer/Dockerfile
+    container_name: clothing-outbox-consumer
     environment:
-      DATABASE_URL: postgresql+psycopg2://clothing:clothing@db:5432/clothing
-      PYTHONUNBUFFERED: "1"
+      <<: [*runtime_env]
+      DATABASE_URL: "postgresql+psycopg2://clothing:clothing@db:5432/clothing"
     command: ["python", "consumer.py"]
     depends_on:
       db:
         condition: service_healthy
     restart: unless-stopped
 
-# ============================================================
-# VOLUMES
-# ============================================================
 volumes:
   pg_data: {}
   minio_data: {}
