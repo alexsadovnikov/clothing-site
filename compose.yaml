@@ -24,27 +24,20 @@ x-db-env: &db_env
   REDIS_URL: "redis://:redispass@redis:6379/0"
 
 x-ai-env: &ai_env
-  # on/off + provider
   AI_ENABLED: "${AI_ENABLED:-true}"
   AI_PROVIDER: "${AI_PROVIDER:-gateway}"
 
-
-  # gateway endpoint (EU VPS)
   AI_GATEWAY_URL: "${AI_GATEWAY_URL:-https://ai.voicecrm.online}"
   AI_GATEWAY_TIMEOUT_S: "${AI_GATEWAY_TIMEOUT_S:-60}"
 
-  # internal auth for worker -> api and api -> gateway
-  # (НЕ задаём дефолт, чтобы не получить 401 и не искать 2 часа)
   AI_INTERNAL_TOKEN: "${AI_INTERNAL_TOKEN}"
 
-  # OpenAI (в РФ можно не задавать вообще)
   OPENAI_API_KEY: "${OPENAI_API_KEY}"
   OPENAI_MODEL: "${OPENAI_MODEL:-gpt-4o-mini}"
   OPENAI_TIMEOUT_S: "${OPENAI_TIMEOUT_S:-45}"
   OPENAI_MAX_TOKENS: "${OPENAI_MAX_TOKENS:-600}"
   OPENAI_TEMPERATURE: "${OPENAI_TEMPERATURE:-0.2}"
 
-  # policies
   AI_MAX_RETRIES: "${AI_MAX_RETRIES:-3}"
   AI_RETRY_BACKOFF_S: "${AI_RETRY_BACKOFF_S:-2}"
   AI_MAX_IMAGE_MB: "${AI_MAX_IMAGE_MB:-15}"
@@ -125,15 +118,11 @@ services:
     environment:
       <<: [*db_env, *minio_env, *meili_env, *runtime_env, *ai_env]
 
-      # Auth
       JWT_SECRET: "supersecret"
       JWT_ALG: "HS256"
       JWT_EXPIRES_MIN: "43200"
 
-      # Public URLs (dev)
       PUBLIC_BASE_URL: "http://127.0.0.1:8001"
-
-      # Runtime extras
       UPLOAD_MAX_BYTES: "15000000"
 
     command: ["uvicorn", "apps.api.main:app", "--host", "0.0.0.0", "--port", "8001", "--log-level", "debug"]
@@ -151,7 +140,35 @@ services:
     restart: unless-stopped
 
   # ============================================================
-  # WORKER (AI + background jobs)
+  # WEB (EDGE / GATEWAY)
+  # ============================================================
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+    container_name: clothing-web
+    environment:
+      PORT: "3000"
+
+      API_HOST: "api"
+      API_PORT: "8001"
+
+      AI_HOST: "ai"
+      AI_PORT: "8002"
+
+      MINIO_HOST: "minio"
+      MINIO_PORT: "9000"
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      api:
+        condition: service_started
+      minio:
+        condition: service_started
+    restart: unless-stopped
+
+  # ============================================================
+  # WORKER
   # ============================================================
   worker:
     build:
@@ -160,13 +177,8 @@ services:
     container_name: clothing-worker
     environment:
       <<: [*db_env, *minio_env, *meili_env, *runtime_env, *ai_env]
-
-      # Queue
       RQ_QUEUE: "clothing"
-
-      # Where worker calls API (docker network)
       AI_INTERNAL_URL: "http://api:8001"
-
     command: ["python", "apps/api/worker.py"]
     depends_on:
       db:
@@ -182,7 +194,7 @@ services:
     restart: unless-stopped
 
   # ============================================================
-  # OUTBOX CONSUMER (DOMAIN EVENTS)
+  # OUTBOX CONSUMER
   # ============================================================
   outbox-consumer:
     build:

@@ -4,6 +4,8 @@ from __future__ import annotations
 import uuid
 from typing import Optional, Literal, Any, Dict, List
 
+from apps.api.contracts.state_ui_map import ui_for_state
+from apps.api.contracts.state import State as UIState
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy.exc import IntegrityError
@@ -133,6 +135,17 @@ def _product_to_out(p: Product) -> dict:
         "updated_at": p.updated_at.isoformat() if p.updated_at else None,
     }
 
+def _ui_for_product_safe(p: Product) -> dict:
+    """
+    Fail-safe UI mapping:
+    - если статус неизвестен контракту → editable fallback
+    - никаких исключений наружу
+    """
+    try:
+        return ui_for_state(UIState(p.status)).dict()
+    except Exception:
+        return ui_for_state(UIState.EDITABLE).dict()
+
 
 def _normalize_status_input_to_event(p: Product, value: str) -> str:
     """
@@ -246,7 +259,7 @@ def create_draft_product(
     return {"id": p.id, "status": p.status}
 
 
-@router.get("/{product_id}", response_model=ProductOut)
+@router.get("/{product_id}", response_model=dict)
 def get_product(
     product_id: str,
     db: Session = Depends(get_db),
@@ -260,7 +273,11 @@ def get_product(
     if not p:
         raise HTTPException(status_code=404, detail="Not Found")
 
-    return _product_to_out(p)
+    out = _product_to_out(p)
+    out["ui"] = _ui_for_product_safe(p)
+    return out
+
+
 
 
 @router.patch("/{product_id}", response_model=ProductOut)
