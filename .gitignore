@@ -53,3 +53,5 @@ tests/
 # python bytecode
 __pycache__/
 *.pyc
+real.jpg
+*.jpg
